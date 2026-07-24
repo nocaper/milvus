@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <memory>
+#include <string>
 
 #include "arrow/io/interfaces.h"
 #include "filemanager/InputStream.h"
@@ -23,7 +24,8 @@ namespace milvus::storage {
 class RemoteInputStream : public milvus::InputStream {
  public:
     explicit RemoteInputStream(
-        std::shared_ptr<arrow::io::RandomAccessFile>&& remote_file);
+        std::shared_ptr<arrow::io::RandomAccessFile>&& remote_file,
+        std::string remote_path = "");
 
     ~RemoteInputStream() override = default;
 
@@ -50,6 +52,7 @@ class RemoteInputStream : public milvus::InputStream {
 
  private:
     size_t file_size_;
+    std::string remote_path_;
     std::shared_ptr<arrow::io::RandomAccessFile> remote_file_;
 };
 

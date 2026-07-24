@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "cachinglayer/Utils.h"
+#include "fmt/ranges.h"
 #include "segcore/Utils.h"
 #include "common/ChunkWriter.h"
 #include "common/EasyAssert.h"
@@ -165,8 +166,14 @@ ChunkTranslator::get_cells(
 
     std::vector<std::string> remote_files;
     remote_files.reserve(cids.size());
+    std::vector<int64_t> row_counts;
+    row_counts.reserve(cids.size());
+    std::vector<int64_t> memory_sizes;
+    memory_sizes.reserve(cids.size());
     for (auto cid : cids) {
         remote_files.push_back(file_infos_[cid].file_path);
+        row_counts.push_back(file_infos_[cid].row_count);
+        memory_sizes.push_back(file_infos_[cid].memory_size);
     }
 
     auto channel = std::make_shared<ArrowReaderChannel>();
@@ -174,6 +181,19 @@ ChunkTranslator::get_cells(
              segment_id_,
              field_id_,
              fmt::format("{}", fmt::join(cids, " ")));
+    LOG_INFO(
+        "[querynode-load-trace] field chunks load start segment={} field={} "
+        "cids={} files={} row_counts={} memory_sizes={} use_mmap={} "
+        "mmap_dir={} priority={}",
+        segment_id_,
+        field_id_,
+        fmt::format("{}", fmt::join(cids, " ")),
+        fmt::format("{}", fmt::join(remote_files, " ")),
+        fmt::format("{}", fmt::join(row_counts, " ")),
+        fmt::format("{}", fmt::join(memory_sizes, " ")),
+        use_mmap_,
+        mmap_dir_path_,
+        static_cast<int>(load_priority_));
     LoadArrowReaderFromRemote(remote_files, channel, load_priority_);
 
     for (auto cid : cids) {
@@ -215,6 +235,17 @@ ChunkTranslator::get_cells(
                                  filepath.string(),
                                  load_priority_);
         }
+        LOG_INFO(
+            "[querynode-load-trace] field chunk materialized segment={} "
+            "field={} cid={} chunk_va={} row_count={} memory_size={} "
+            "use_mmap={}",
+            segment_id_,
+            field_id_,
+            cid,
+            static_cast<const void*>(chunk.get()),
+            file_infos_[cid].row_count,
+            file_infos_[cid].memory_size,
+            use_mmap_);
         cells.emplace_back(cid, std::move(chunk));
     }
 

@@ -9,6 +9,7 @@
 #include "common/common_type_c.h"
 #include "common/resource_c.h"
 #include "fmt/core.h"
+#include "fmt/ranges.h"
 #include "glog/logging.h"
 #include "index/Index.h"
 #include "index/IndexFactory.h"
@@ -159,6 +160,7 @@ SealedIndexTranslator::get_cells(milvus::OpContext* ctx,
     std::unique_ptr<milvus::index::IndexBase> index =
         milvus::index::IndexFactory::GetInstance().CreateIndex(
             index_info_, file_manager_context_);
+    auto* index_ptr = index.get();
     index->SetCellSize(milvus::cachinglayer::ResourceUsage(
         load_resource_request_.final_memory_cost,
         load_resource_request_.final_disk_cost));
@@ -187,6 +189,30 @@ SealedIndexTranslator::get_cells(milvus::OpContext* ctx,
         milvus::index::GetValueFromConfig<int32_t>(
             config_, milvus::index::SCALAR_INDEX_ENGINE_VERSION)
             .value_or(1);
+    LOG_INFO(
+        "[querynode-load-trace] index load start segment={} field={} index={} "
+        "index_va={} index_type={} index_size={} index_file_count={} "
+        "index_files={} enable_mmap={} mmap_dir={} num_rows={} dim={} "
+        "final_memory_cost={} final_disk_cost={} max_memory_cost={} "
+        "max_disk_cost={} scalar_index_version={} cids={}",
+        index_load_info_.segment_id,
+        index_load_info_.field_id,
+        index_load_info_.index_id,
+        static_cast<const void*>(index_ptr),
+        index_info_.index_type,
+        index_load_info_.index_size,
+        index_load_info_.index_files.size(),
+        fmt::format("{}", fmt::join(index_load_info_.index_files, " ")),
+        index_load_info_.enable_mmap,
+        index_load_info_.mmap_dir_path,
+        index_load_info_.num_rows,
+        index_load_info_.dim,
+        load_resource_request_.final_memory_cost,
+        load_resource_request_.final_disk_cost,
+        load_resource_request_.max_memory_cost,
+        load_resource_request_.max_disk_cost,
+        scalar_version,
+        fmt::format("{}", fmt::join(cids, " ")));
     if (scalar_version >= 3 && !IsVectorDataType(index_info_.field_type)) {
         config_[milvus::index::COLLECTION_ID] =
             file_manager_context_.fieldDataMeta.collection_id;
@@ -196,6 +222,20 @@ SealedIndexTranslator::get_cells(milvus::OpContext* ctx,
         LOG_INFO("load index with configs: {}", config_.dump());
         index->Load(ctx_, config_);
     }
+    LOG_INFO(
+        "[querynode-load-trace] index load done segment={} field={} index={} "
+        "index_va={} index_type={} index_size={} index_file_count={} "
+        "enable_mmap={} final_memory_cost={} final_disk_cost={}",
+        index_load_info_.segment_id,
+        index_load_info_.field_id,
+        index_load_info_.index_id,
+        static_cast<const void*>(index_ptr),
+        index_info_.index_type,
+        index_load_info_.index_size,
+        index_load_info_.index_files.size(),
+        index_load_info_.enable_mmap,
+        load_resource_request_.final_memory_cost,
+        load_resource_request_.final_disk_cost);
 
     std::vector<std::pair<cid_t, std::unique_ptr<milvus::index::IndexBase>>>
         result;

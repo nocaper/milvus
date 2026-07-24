@@ -225,7 +225,7 @@ class FileManagerImpl : public milvus::FileManager {
                    remote_file.status().ToString());
         return std::static_pointer_cast<milvus::InputStream>(
             std::make_shared<milvus::storage::RemoteInputStream>(
-                std::move(remote_file.ValueOrDie())));
+                std::move(remote_file.ValueOrDie()), remote_file_path));
     }
 
     std::shared_ptr<OutputStream>

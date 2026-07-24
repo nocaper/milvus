@@ -504,13 +504,23 @@ func NewSegment(ctx context.Context,
 		return nil, err
 	}
 	logger.Info(ctx, "create segment done")
+	csegmentPtr := csegment.RawPointer()
+	traceFields := segmentLoadInfoTraceFields(loadInfo)
+	traceFields = append(traceFields,
+		mlog.String("segmentType", segmentType.String()),
+		mlog.Uintptr("cSegmentVA", uintptr(unsafe.Pointer(csegmentPtr))),
+		mlog.String("cSegmentVAHex", fmt.Sprintf("0x%x", uintptr(unsafe.Pointer(csegmentPtr)))),
+		mlog.Int64("estimatedRelatedDataSize", calculateSegmentLogSize(loadInfo)),
+		mlog.Int64("estimatedSegmentMemorySize", calculateSegmentMemorySize(loadInfo)),
+	)
+	mlog.Info(ctx, queryNodeLoadTraceTag+" csegment created", traceFields...)
 
 	segment := &LocalSegment{
 		baseSegment:        base,
 		bm25StatsHolder:    newBM25StatsHolder(),
 		manager:            manager,
 		ptrLock:            locker,
-		ptr:                C.CSegmentInterface(csegment.RawPointer()),
+		ptr:                C.CSegmentInterface(csegmentPtr),
 		csegment:           csegment,
 		lastDeltaTimestamp: atomic.NewUint64(0),
 		fields:             typeutil.NewConcurrentMap[int64, *FieldInfo](),
@@ -1239,6 +1249,27 @@ func GetCLoadInfoWithFunc(ctx context.Context,
 		return err
 	}
 	loadIndexInfo.setShard(loadInfo.GetInsertChannel())
+	mlog.Info(ctx, queryNodeLoadTraceTag+" c load index info prepared",
+		mlog.FieldCollectionID(loadInfo.GetCollectionID()),
+		mlog.FieldPartitionID(loadInfo.GetPartitionID()),
+		mlog.FieldSegmentID(loadInfo.GetSegmentID()),
+		mlog.FieldFieldID(indexInfo.GetFieldID()),
+		mlog.FieldIndexID(indexInfo.GetIndexID()),
+		mlog.FieldBuildID(indexInfo.GetBuildID()),
+		mlog.Int64("indexVersion", indexInfo.GetIndexVersion()),
+		mlog.Int32("currentIndexVersion", indexInfo.GetCurrentIndexVersion()),
+		mlog.Int32("currentScalarIndexVersion", indexInfo.GetCurrentScalarIndexVersion()),
+		mlog.String("indexStorePathVersion", indexInfo.GetIndexStorePathVersion().String()),
+		mlog.Int64("indexFileSize", indexInfo.GetIndexSize()),
+		mlog.Int64("numRows", indexInfo.GetNumRows()),
+		mlog.Bool("enableMmap", enableMmap),
+		mlog.String("fieldName", fieldSchema.GetName()),
+		mlog.String("fieldType", fieldSchema.GetDataType().String()),
+		mlog.Int("indexFileCount", len(indexInfo.GetIndexFilePaths())),
+		mlog.Strings("indexFiles", indexInfo.GetIndexFilePaths()),
+		mlog.Uintptr("cLoadIndexInfoVA", uintptr(unsafe.Pointer(loadIndexInfo.cLoadIndexInfo))),
+		mlog.String("cLoadIndexInfoVAHex", fmt.Sprintf("0x%x", uintptr(unsafe.Pointer(loadIndexInfo.cLoadIndexInfo)))),
+	)
 	return f(loadIndexInfo)
 }
 
@@ -1290,10 +1321,36 @@ func (s *LocalSegment) syncFieldJSONStatsFromLoadInfo(ctx context.Context, loadI
 }
 
 func (s *LocalSegment) Load(ctx context.Context) error {
+	start := time.Now()
+	loadInfo := s.LoadInfo()
+	traceFields := segmentLoadInfoTraceFields(loadInfo)
+	traceFields = append(traceFields,
+		mlog.String("segmentType", s.Type().String()),
+		mlog.Uintptr("cSegmentVA", uintptr(unsafe.Pointer(s.ptr))),
+		mlog.String("cSegmentVAHex", fmt.Sprintf("0x%x", uintptr(unsafe.Pointer(s.ptr)))),
+	)
+	mlog.Info(ctx, queryNodeLoadTraceTag+" csegment load start", traceFields...)
 	if err := s.csegment.Load(ctx); err != nil {
+		failedFields := segmentLoadInfoTraceFields(loadInfo)
+		failedFields = append(failedFields,
+			mlog.String("segmentType", s.Type().String()),
+			mlog.Uintptr("cSegmentVA", uintptr(unsafe.Pointer(s.ptr))),
+			mlog.Duration("loadDuration", time.Since(start)),
+			mlog.Err(err),
+		)
+		mlog.Warn(ctx, queryNodeLoadTraceTag+" csegment load failed", failedFields...)
 		return err
 	}
 	s.syncFieldJSONStatsFromLoadInfo(ctx, s.LoadInfo())
+	doneFields := segmentLoadInfoTraceFields(loadInfo)
+	doneFields = append(doneFields,
+		mlog.String("segmentType", s.Type().String()),
+		mlog.Uintptr("cSegmentVA", uintptr(unsafe.Pointer(s.ptr))),
+		mlog.String("cSegmentVAHex", fmt.Sprintf("0x%x", uintptr(unsafe.Pointer(s.ptr)))),
+		mlog.Duration("loadDuration", time.Since(start)),
+		mlog.Int64("cSegmentMemSize", s.csegment.MemSize()),
+	)
+	mlog.Info(ctx, queryNodeLoadTraceTag+" csegment load done", doneFields...)
 	return nil
 }
 

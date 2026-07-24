@@ -1113,6 +1113,13 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 	if !ok {
 		return merr.WrapErrParameterInvalid("LocalSegment", fmt.Sprintf("%T", seg))
 	}
+	loadTraceStart := time.Now()
+	loadTraceFields := segmentLoadInfoTraceFields(loadInfo)
+	loadTraceFields = append(loadTraceFields,
+		mlog.String("segmentType", segment.Type().String()),
+		mlog.Int32("priorityValue", int32(loadInfo.GetPriority())),
+	)
+	mlog.Info(ctx, queryNodeLoadTraceTag+" segment files load start", loadTraceFields...)
 	mlog.Info(context.TODO(), "start loading segment files",
 		mlog.Int64("rowNum", loadInfo.GetNumOfRows()),
 		mlog.String("segmentType", segment.Type().String()),
@@ -1141,6 +1148,16 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 	binlogSize := calculateSegmentMemorySize(segment.LoadInfo())
 	segment.manager.AddLoadedBinlogSize(binlogSize)
 	segment.binlogSize.Store(binlogSize)
+	loadTraceDoneFields := segmentLoadInfoTraceFields(loadInfo)
+	loadTraceDoneFields = append(loadTraceDoneFields,
+		mlog.String("segmentType", segment.Type().String()),
+		mlog.Duration("loadDuration", time.Since(loadTraceStart)),
+		mlog.Int64("relatedDataSize", relatedDataSize),
+		mlog.Int64("loadedBinlogMemorySize", binlogSize),
+		mlog.Int64("cSegmentMemSize", segment.MemSize()),
+		mlog.Int64("rowNumAfterLoad", segment.RowNum()),
+	)
+	mlog.Info(ctx, queryNodeLoadTraceTag+" segment files load done", loadTraceDoneFields...)
 
 	// load statslog if it's growing segment
 	if segment.segmentType == SegmentTypeGrowing {
@@ -1212,6 +1229,7 @@ func (loader *segmentLoader) loadBm25Stats(ctx context.Context, segmentID int64,
 	if err != nil {
 		return err
 	}
+	traceGoLoadedObjects(ctx, segmentID, "bm25Stats", pathList, values)
 
 	cnt := 0
 	for i, fieldID := range fieldList {
@@ -1284,6 +1302,7 @@ func (loader *segmentLoader) loadBloomFilterWithDownloader(
 	if err != nil {
 		return err
 	}
+	traceGoLoadedObjects(ctx, segmentID, "pkStats", binlogPaths, values)
 	blobs := make([]*storage.Blob, len(values))
 	for i := range values {
 		blobs[i] = &storage.Blob{Value: values[i]}
@@ -1488,7 +1507,11 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 		}
 		if err := readPaths(paths,
 			storage.WithDownloader(func(ctx context.Context, paths []string) ([][]byte, error) {
-				return loader.cm.MultiRead(ctx, paths)
+				values, err := loader.cm.MultiRead(ctx, paths)
+				if err == nil {
+					traceGoLoadedObjects(ctx, segment.ID(), "deltaLog", paths, values)
+				}
+				return values, err
 			}),
 		); err != nil {
 			return err

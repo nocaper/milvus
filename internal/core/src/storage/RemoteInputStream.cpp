@@ -104,8 +104,9 @@ ReadWithRetry(const char* operation,
 }  // namespace
 
 RemoteInputStream::RemoteInputStream(
-    std::shared_ptr<arrow::io::RandomAccessFile>&& remote_file)
-    : remote_file_(std::move(remote_file)) {
+    std::shared_ptr<arrow::io::RandomAccessFile>&& remote_file,
+    std::string remote_path)
+    : remote_path_(std::move(remote_path)), remote_file_(std::move(remote_file)) {
     auto status = remote_file_->GetSize();
     AssertInfo(status.ok(), "Failed to get size of remote file");
     file_size_ = static_cast<size_t>(status.ValueOrDie());
@@ -114,6 +115,7 @@ RemoteInputStream::RemoteInputStream(
 size_t
 RemoteInputStream::Read(void* data, size_t size) {
     auto offset = static_cast<int64_t>(Tell());
+    auto start = std::chrono::steady_clock::now();
     auto status = ReadWithRetry(
         "read",
         size,
@@ -129,11 +131,26 @@ RemoteInputStream::Read(void* data, size_t size) {
         size,
         file_size_,
         status.status().ToString());
-    return static_cast<size_t>(status.ValueOrDie());
+    auto bytes_read = static_cast<size_t>(status.ValueOrDie());
+    LOG_INFO(
+        "[querynode-load-trace] remote input stream read object_path={} "
+        "buffer_va={} requested_size={} bytes_read={} offset={} file_size={} "
+        "read_us={}",
+        remote_path_,
+        static_cast<const void*>(data),
+        size,
+        bytes_read,
+        offset,
+        file_size_,
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count());
+    return bytes_read;
 }
 
 size_t
 RemoteInputStream::ReadAt(void* data, size_t offset, size_t size) {
+    auto start = std::chrono::steady_clock::now();
     auto status = ReadWithRetry(
         "read at offset",
         size,
@@ -150,7 +167,21 @@ RemoteInputStream::ReadAt(void* data, size_t offset, size_t size) {
                size,
                file_size_,
                status.status().ToString());
-    return static_cast<size_t>(status.ValueOrDie());
+    auto bytes_read = static_cast<size_t>(status.ValueOrDie());
+    LOG_INFO(
+        "[querynode-load-trace] remote input stream read_at object_path={} "
+        "buffer_va={} requested_size={} bytes_read={} offset={} file_size={} "
+        "read_us={}",
+        remote_path_,
+        static_cast<const void*>(data),
+        size,
+        bytes_read,
+        offset,
+        file_size_,
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count());
+    return bytes_read;
 }
 
 size_t
@@ -163,6 +194,7 @@ RemoteInputStream::Read(int fd, size_t size) {
     while (rest_size > 0) {
         size_t read_size = std::min(rest_size, read_batch_size);
         auto offset = static_cast<int64_t>(Tell());
+        auto start = std::chrono::steady_clock::now();
         auto status = ReadWithRetry(
             "read to file",
             read_size,
@@ -197,6 +229,19 @@ RemoteInputStream::Read(int fd, size_t size) {
                    bytes_read,
                    read_size,
                    file_size_);
+        LOG_INFO(
+            "[querynode-load-trace] remote input stream read_to_file "
+            "object_path={} buffer_va={} requested_size={} bytes_read={} "
+            "offset={} file_size={} read_us={}",
+            remote_path_,
+            static_cast<const void*>(data.data()),
+            read_size,
+            bytes_read,
+            offset,
+            file_size_,
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count());
         auto bytes_to_write = static_cast<size_t>(bytes_read);
         ssize_t ret = ::write(fd, data.data(), bytes_to_write);
         AssertInfo(ret == static_cast<ssize_t>(bytes_to_write),

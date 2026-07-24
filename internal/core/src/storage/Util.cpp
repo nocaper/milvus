@@ -16,6 +16,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <chrono>
 #include "common/FastMem.h"
 
 #include "arrow/array/builder_binary.h"
@@ -1030,10 +1031,37 @@ GetObjectData(ChunkManager* remote_chunk_manager,
     auto DownloadAndDeserialize = [](ChunkManager* chunk_manager,
                                      bool is_field_data,
                                      const std::string file) {
+        auto total_start = std::chrono::steady_clock::now();
         // TODO remove this Size() cost
+        auto size_start = std::chrono::steady_clock::now();
         auto fileSize = chunk_manager->Size(file);
+        auto size_end = std::chrono::steady_clock::now();
         auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize]);
-        chunk_manager->Read(file, buf.get(), fileSize);
+        auto* raw_buf = buf.get();
+        auto read_start = std::chrono::steady_clock::now();
+        auto bytes_read = chunk_manager->Read(file, raw_buf, fileSize);
+        auto read_end = std::chrono::steady_clock::now();
+        LOG_INFO(
+            "[querynode-load-trace] remote object loaded file={} object_va={} "
+            "object_size={} bytes_read={} is_field_data={} chunk_manager={} "
+            "bucket={} root={} size_us={} read_us={} total_us={}",
+            file,
+            static_cast<const void*>(raw_buf),
+            fileSize,
+            bytes_read,
+            is_field_data,
+            chunk_manager->GetName(),
+            chunk_manager->GetBucketName(),
+            chunk_manager->GetRootPath(),
+            std::chrono::duration_cast<std::chrono::microseconds>(size_end -
+                                                                  size_start)
+                .count(),
+            std::chrono::duration_cast<std::chrono::microseconds>(read_end -
+                                                                  read_start)
+                .count(),
+            std::chrono::duration_cast<std::chrono::microseconds>(read_end -
+                                                                  total_start)
+                .count());
         auto res = DeserializeFileData(buf, fileSize, is_field_data);
         return res;
     };

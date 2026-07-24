@@ -14,6 +14,7 @@
 
 #include <cxxabi.h>
 #include <fmt/core.h>
+#include <fmt/ranges.h>
 #include <folly/ScopeGuard.h>
 #include <folly/Try.h>
 #include <simdjson.h>
@@ -1996,12 +1997,27 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
     }
 
     auto needed_columns = schema_snapshot->GetExternalColumnNames();
+    LOG_INFO(
+        "[querynode-load-trace] manifest column groups load start segment={} "
+        "collection={} partition={} num_rows={} storage_version={} "
+        "manifest_path={} column_group_count={} external_collection={} "
+        "needed_columns={}",
+        id_,
+        segment_load_info.GetCollectionID(),
+        segment_load_info.GetPartitionID(),
+        segment_load_info.GetNumOfRows(),
+        segment_load_info.GetStorageVersion(),
+        segment_load_info.GetManifestPath(),
+        column_groups->size(),
+        schema_snapshot->is_external_collection(),
+        fmt::format("{}", *needed_columns));
     auto reader = std::shared_ptr<milvus_storage::api::Reader>(
         milvus_storage::api::Reader::create(column_groups,
                                             /*arrow_schema=*/nullptr,
                                             needed_columns,
                                             *properties)
             .release());
+    auto* reader_ptr = reader.get();
     committer.Commit(
         [reader = std::move(reader)](RuntimeResourceState& runtime,
                                      PublishedSegmentState&) mutable {
@@ -2016,6 +2032,13 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
         "[LoadColumnGroups] segment {} reader created in {}ms, {} column "
         "groups",
         id_,
+        reader_create_ms,
+        column_groups->size());
+    LOG_INFO(
+        "[querynode-load-trace] manifest column groups reader created "
+        "segment={} reader_va={} reader_create_ms={} column_group_count={}",
+        id_,
+        static_cast<const void*>(reader_ptr),
         reader_create_ms,
         column_groups->size());
 
@@ -8075,6 +8098,24 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     // Determine warmup policy: use per-field settings if any,
     // otherwise pass empty string to fall back to global config
     std::string warmup_policy = aggregated_warmup_policy;
+    LOG_INFO(
+        "[querynode-load-trace] manifest column group load start segment={} "
+        "collection={} partition={} cg_index={} field_ids={} needed_columns={} "
+        "eager_load={} is_replace={} use_mmap={} priority={} warmup={} "
+        "manifest_path={} estimated_bytes_per_row={}",
+        get_segment_id(),
+        segment_load_info.GetCollectionID(),
+        segment_load_info.GetPartitionID(),
+        index,
+        FormatFieldIds(milvus_field_ids),
+        fmt::format("{}", *needed_columns),
+        eager_load,
+        is_replace,
+        use_mmap,
+        static_cast<int>(segment_load_info.GetPriority()),
+        warmup_policy,
+        segment_load_info.GetManifestPath(),
+        segment_load_info.GetEstimatedBytesPerRow());
 
     // Multiple lazy entries can share the same column-group index (one per
     // field), so the translator cache key must be disambiguated by the
@@ -8104,6 +8145,15 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             segment_load_info.GetInsertChannel());
     auto chunked_column_group =
         std::make_shared<ChunkedColumnGroup>(std::move(translator));
+    LOG_INFO(
+        "[querynode-load-trace] manifest column group materialized segment={} "
+        "cg_index={} field_ids={} column_group_va={} use_mmap={} eager_load={}",
+        get_segment_id(),
+        index,
+        FormatFieldIds(milvus_field_ids),
+        static_cast<const void*>(chunked_column_group.get()),
+        use_mmap,
+        eager_load);
 
     // Create ProxyChunkColumn for each field
     for (const auto& field_id : milvus_field_ids) {
