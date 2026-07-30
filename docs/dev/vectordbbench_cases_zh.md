@@ -1096,70 +1096,586 @@ CloudColdLatencyCase 专门测这类首查体验。
 - warm latency 正常但 cold latency 高，说明常规 QPS benchmark 没覆盖用户首查体验。
 - 对 serverless、云托管、低频租户非常重要。
 
-## 11. Full Text Search Case
+## 11. Full Text Search Performance Case
 
-FTS case 是 VectorDBBench 为全文检索补充的 benchmark。它不测向量相似度，而测 BM25 文本检索。
+Full Text Search Performance Case 是 VectorDBBench 在 2026-06 新增的全文检索 benchmark 路径。它的核心不是 dense vector ANN，而是 BM25-style full text retrieval。
 
-### 11.1 FTSBm25Performance
+注意命名：
+
+- 发布说明里把这类测试称为 `FullTextSearchPerformance`。
+- 当前源码里的可选 `CaseType` 是 `FTSBm25Performance`。
+- 源码里的 `CaseLabel` 是 `FullTextSearchPerformance`。
+
+也就是说，用户运行时选择的是 `--case-type FTSBm25Performance`，但它属于 Full Text Search Performance 这个大类。
+
+### 11.1 这个 case 测什么
+
+**核心问题**
+
+同一份 raw text corpus，被不同数据库建立全文索引以后，在 BM25 排序语义下：
+
+- 文档插入要多久。
+- 全文索引或 optimize 要多久。
+- BM25 topK 结果是否符合数学 ground truth。
+- 单查询延迟是多少。
+- 并发查询 QPS 是多少。
+- 返回 text payload 后吞吐和延迟会下降多少。
+
+它不是在测：
+
+- embedding 相似度。
+- dense vector ANN。
+- semantic relevance。
+- reranker 后的最终排序质量。
+- 端到端 RAG 回答质量。
+
+### 11.2 为什么需要 FTS case
+
+现代向量数据库越来越多地支持混合检索：
+
+- dense vector search。
+- sparse vector search。
+- keyword search。
+- BM25 full text search。
+- metadata filter。
+- hybrid search。
+- rerank。
+
+如果 benchmark 只测 dense vector，会漏掉一个关键问题：数据库自己的全文索引路径到底强不强。
+
+FTS case 单独把 text-only BM25 层拆出来测。这样可以回答：
+
+- 这个数据库的全文索引构建是否快。
+- tokenizer / analyzer 行为是否稳定。
+- BM25 ranking 是否和声明的数学 ground truth 一致。
+- 返回文本字段时，payload 成本有多大。
+- 在 hybrid search 里，keyword/BM25 这一路是否会成为瓶颈。
+
+### 11.3 和向量 Search Performance Case 的区别
+
+| 对比项 | Vector Search Performance | Full Text Search Performance |
+| --- | --- | --- |
+| 输入主数据 | dense embedding vector | raw text document |
+| 查询输入 | query vector | query text |
+| 检索算法 | ANN / vector similarity | inverted index / BM25 |
+| metric | L2 / Cosine / IP | BM25 |
+| ground truth | 向量最近邻结果 | BM25 数学 topK |
+| 召回含义 | ANN 是否找回向量近邻 | backend 是否符合 BM25 ranking contract |
+| 主要压力 | 向量索引、距离计算、topK merge | analyzer、倒排索引、BM25 scorer、文本字段读取 |
+| payload | ids / scalar / vector | ids / text |
+| Milvus 相关路径 | Knowhere / QueryNode vector search | Tantivy / full text index / BM25 search |
+
+### 11.4 CaseType: FTSBm25Performance
 
 **测试目标**
 
-- 测 BM25 全文检索的构建、召回、延迟和吞吐。
+- 测 BM25 全文检索的 end-to-end 行为。
+- 同时覆盖 load、insert、optimize、serial recall、serial latency、concurrent QPS、payload profile。
 
-**为什么需要这个 case**
+**源码定义重点**
 
-现代向量数据库越来越多地支持 hybrid search：
+- `case_id`: `CaseType.FTSBm25Performance`
+- `label`: `CaseLabel.FullTextSearchPerformance`
+- `dataset`: `FtsDatasetManager`
+- `metric_type`: `BM25`
+- `filter_rate`: `None`
+- `filters`: `non_filter`
+- 默认数据集: `MS MARCO Small (100K documents)`
 
-- vector search。
-- keyword search。
-- BM25。
-- sparse vector。
-- metadata filtering。
+FTS case 当前不是 filter case。它默认不做 metadata filter，重点是文本检索路径本身。
 
-如果只测 dense vector，就看不到文本检索能力。
+### 11.5 支持的数据集和子 case
 
-**使用数据**
+当前 FTS 数据集按 dataset-with-size-type 选择。
 
-| 数据集 | 典型规模 | 含义 |
+| DatasetWithSizeType | 文档数 | 适合测试什么 |
 | --- | --- | --- |
-| MS MARCO | 100K / 1M / 8.84M | Passage ranking 文本检索数据 |
-| HotpotQA | 100K / 1M / 5.23M | 多跳问答文本数据 |
+| `MS MARCO Small (100K documents)` | 100K | 本地 smoke test、功能验证、小规模文本索引 |
+| `MS MARCO Medium (1M documents)` | 1M | 中等规模 passage retrieval |
+| `MS MARCO Large (8.8M documents)` | 8,841,823 | 大规模 passage retrieval |
+| `HotpotQA Small (100K documents)` | 100K | 小规模多跳问答文本检索 |
+| `HotpotQA Medium (1M documents)` | 1M | 中等规模问答文本检索 |
+| `HotpotQA Large (5.2M documents)` | 5,233,329 | 大规模问答文本检索 |
 
-**测试任务**
+### 11.6 MS MARCO 测试任务
 
-- 插入文本文档。
-- 构建 BM25 或全文索引。
-- 执行文本 query。
-- 用 BM25 ground truth 计算 recall。
-- 测 serial latency 和 concurrent QPS。
+**数据特点**
+
+- Passage retrieval 数据。
+- 文档一般是 passage text。
+- query 是自然语言检索 query。
+
+**测试目标**
+
+- 检查数据库处理短文本 passage corpus 的 BM25 能力。
+- 适合模拟搜索引擎、RAG passage recall、文档片段召回。
 
 **测试流程**
 
-1. 准备 raw text corpus。
-2. 准备 query text。
-3. 准备 BM25 ground truth。
-4. 创建文本字段和全文索引。
-5. 插入文档。
-6. 执行 optimize / readiness。
-7. serial search 计算 recall。
-8. concurrent search 计算 QPS 和 latency。
+1. 通过 `ir_datasets` 加载 MS MARCO 数据。
+2. 将原始 query 转换成内部 `FtsQuery(query_id, text)`。
+3. 将原始 doc 转换成内部 `FtsDocument(doc_id, text)`。
+4. 清理 doc text 里的 tab 和换行。
+5. 下载数学 BM25 ground truth。
+6. 读取 build manifest 里的 BM25/analyzer 参数。
+7. 插入前 N 条文档。
+8. 构建全文索引。
+9. 执行 query text 搜索。
+10. 和 BM25 ground truth 比 recall。
 
-**payload profile**
+**关注点**
 
-- ids only：只返回文档 ID。
-- text payload：返回文本字段。
+- passage 数量增大以后，倒排索引构建是否线性变慢。
+- query latency 是否随着 corpus 规模明显上升。
+- analyzer 与 ground truth 的 analyzer 是否一致。
+- text payload 返回是否显著拖慢结果。
 
-**结果解读**
+### 11.7 HotpotQA 测试任务
 
-- recall 是相对于 BM25 ground truth 的一致性，不是人工语义相关性。
-- text payload 会增加响应体和序列化成本。
-- FTS case 适合检查 hybrid search 中 keyword/BM25 部分是否能独立撑住。
+**数据特点**
 
-**它不能说明什么**
+- 多跳问答数据。
+- 文档可能包含 title 和 text。
+- VectorDBBench 的 translator 会把 title 和 text 拼接成最终检索文本。
 
-- 不能代表 dense vector search 性能。
-- 不能直接代表 reranker 后的最终排序质量。
-- 不能替代端到端 RAG 质量评估。
+**测试目标**
+
+- 检查数据库在问答类文档上的 BM25 检索能力。
+- 更接近 QA / RAG 场景里的知识文本召回。
+
+**测试流程**
+
+1. 通过 `ir_datasets` 加载 HotpotQA。
+2. 将 query 转换成 `FtsQuery(query_id, text)`。
+3. 将文档的 title 和 text 拼接成 `FtsDocument(doc_id, text)`。
+4. 清理 tab、换行和空白。
+5. 下载数学 BM25 ground truth。
+6. 读取 build manifest。
+7. 插入文档。
+8. 构建全文索引。
+9. 执行 BM25 查询。
+10. 汇总 recall、latency、QPS。
+
+**关注点**
+
+- title + body 拼接后 analyzer 行为是否一致。
+- 长文本字段是否影响索引构建和查询延迟。
+- 返回 text payload 时响应体更大，QPS 是否明显下降。
+
+### 11.8 FTS 数据准备阶段
+
+FTS 的 `prepare()` 和向量数据集不一样。
+
+它会做这些事：
+
+1. 通过 `ir_datasets` 下载或读取原始文本数据。
+2. 使用 translator 把外部数据 schema 转成 VectorDBBench 内部 schema。
+3. 预先遍历 documents，避免 `ir_datasets` 的 lazy document cache 把成本混进 timed insert。
+4. 加载 query text。
+5. 从远端下载数学 BM25 ground truth 文件。
+6. 加载 build manifest。
+7. 校验 manifest 和数据集规模是否一致。
+8. 加载 BM25 参数和 analyzer 参数。
+
+这个阶段很重要，因为 FTS case 的 correctness 强依赖 manifest。
+
+### 11.9 FTS 内部数据结构
+
+FTS 不使用 vector dataset 的 train/test parquet 结构，而使用独立的文本结构。
+
+| 内部对象 | 字段 | 含义 |
+| --- | --- | --- |
+| `FtsQuery` | `query_id`, `text` | 一条文本查询 |
+| `FtsDocument` | `doc_id`, `text` | 一条被索引的文本 |
+| `FtsBaseDataset` | `name`, `size`, `metric_type`, `with_gt` | FTS 数据集元信息 |
+| `FtsDatasetManager` | `queries_data`, `gt_data`, `bm25_params`, `analyzer_params` | FTS 数据集管理器 |
+
+### 11.10 FTS ground truth 文件
+
+FTS 数学 ground truth 主要依赖这些文件：
+
+| 文件 | 作用 |
+| --- | --- |
+| `neighbors.parquet` | 每个 query 对应的 BM25 topK 文档 ID |
+| `build_manifest.json` | 生成 ground truth 时使用的 BM25 和 analyzer 参数 |
+| `manifest.json` | 数据集 manifest 元信息 |
+
+源码里 ground truth 字段默认是：
+
+```text
+neighbors_id
+```
+
+需要特别注意：FTS math ground truth 使用的是 dense document row IDs，不一定是原始 `ir_datasets` 的 doc_id。VectorDBBench 在插入文档时会按插入顺序把 `doc.doc_id` 重新设置成 row id 字符串，这样搜索结果才能和 `neighbors.parquet` 对齐。
+
+### 11.11 build manifest 里有什么
+
+build manifest 可能包含：
+
+- `source_ir_dataset`
+- `doc_limit`
+- `indexed_doc_count`
+- `query_count`
+- `bm25.k1`
+- `bm25.b`
+- `bm25.avgdl`
+- `analyzer`
+
+VectorDBBench 会做校验：
+
+- manifest 的 source dataset 必须和当前 translator 对应的数据集一致。
+- `doc_limit` / `indexed_doc_count` 必须和 case size 一致。
+- `query_count` 必须和加载到的 query 数量一致。
+
+如果这些不一致，FTS recall 就不能信。
+
+### 11.12 BM25 参数和 analyzer 参数
+
+FTS case 会在 backend 初始化前读取 manifest 参数，并尝试把它们应用到 database case config。
+
+这些参数包括：
+
+- `k1`
+- `b`
+- `avgdl`
+- tokenizer 设置
+- lowercase 设置
+- stop words
+- stemming
+- token length limit
+- field normalization
+
+不同后端支持的参数不一样：
+
+- 有些后端暴露 `k1` 和 `b`。
+- 有些后端隐藏或固定 `avgdl`。
+- 有些后端 analyzer 不可完全配置。
+- 有些后端只能记录“未应用参数”。
+
+所以比较 FTS 结果时，必须把 applied / unapplied BM25 参数和 analyzer 参数写到报告里。否则 recall 差异可能来自 analyzer 不一致，而不是引擎实现差异。
+
+### 11.13 FTS load 阶段
+
+**做什么**
+
+- 创建全文检索 collection / index / table / namespace。
+- 按 batch 插入 `FtsDocument`。
+- 每条文档至少包含：
+  - doc id。
+  - text 字段。
+- 记录 insert duration 和 inserted count。
+
+**压什么**
+
+- 文本字段写入。
+- 文本字段序列化。
+- tokenizer 前处理。
+- 倒排索引写入。
+- WAL / flush / segment。
+- 后端批量写入能力。
+
+**和向量 load 的区别**
+
+- 不需要 vector dimension。
+- 不做 vector normalization。
+- 主要压力来自文本处理和倒排索引。
+
+### 11.14 FTS optimize 阶段
+
+**做什么**
+
+- 调用 backend 的 optimize / index readiness。
+- 等待全文索引可搜索。
+
+不同后端里 optimize 的含义可能不同：
+
+- Milvus/Zilliz Cloud: 等待 full text index / collection readiness。
+- Elasticsearch/OpenSearch: 可能涉及 refresh、force merge 或 index readiness。
+- Vespa: 可能涉及 document indexing readiness。
+- turbopuffer: 可能涉及 namespace full text path readiness。
+
+**压什么**
+
+- 倒排索引构建。
+- posting list 合并。
+- term dictionary 构建。
+- 文档长度统计。
+- BM25 统计信息。
+- 后台 merge / compaction。
+
+### 11.15 FTS serial search 阶段
+
+**做什么**
+
+- 使用 query text 执行 BM25 检索。
+- 返回 topK doc ids。
+- 和 BM25 ground truth 比较。
+- 输出 recall、p99、p95。
+
+源码里 FTS serial search 的返回值和 vector search 不同：
+
+- vector case: `recall`, `ndcg`, `serial_latency_p99`, `serial_latency_p95`
+- FTS case: `recall`, `serial_latency_p99`, `serial_latency_p95`
+
+FTS 当前不输出 NDCG 作为主结果。
+
+**压什么**
+
+- query analyzer。
+- term lookup。
+- posting list traversal。
+- BM25 score 计算。
+- topK heap / collector。
+- score 排序。
+
+### 11.16 FTS concurrent search 阶段
+
+**做什么**
+
+- 使用相同 query text 集合。
+- 按 concurrency 列表启动多并发。
+- 每个并发档位跑固定 duration。
+- 输出 QPS、p99、p95、avg latency。
+
+**压什么**
+
+- 多 query 并发调度。
+- 倒排索引并发访问。
+- BM25 scorer 并行度。
+- 内存缓存。
+- response serialization。
+- 网络。
+
+**怎么解读**
+
+- QPS 高但 p99 高，说明吞吐可能靠排队堆出来，线上体验未必好。
+- QPS 高但 recall 低，说明结果不可信。
+- text payload QPS 低，不一定是 BM25 scorer 慢，也可能是返回文本字段慢。
+
+### 11.17 FTS payload profile
+
+FTS case 重点支持两种 payload：
+
+| payload_profile | 返回内容 | 用途 |
+| --- | --- | --- |
+| `ids_only` | 只返回文档 ID 和 score/distance 类信息 | 最干净的 recall 和吞吐基线 |
+| `text` | 返回文档 ID 加文本字段 | 测真实应用返回文本片段的开销 |
+
+源码里 payload 大小估算大致是：
+
+- `ids_only`: 每个 hit 约 20 bytes。
+- `text`: 每个 hit 约 20 + 512 bytes。
+
+这只是估算，用来帮助解释响应体成本。真实大小取决于文本长度、编码、协议和 backend 返回格式。
+
+### 11.18 ids_only 和 text payload 应该怎么跑
+
+建议分两轮跑：
+
+1. 先跑 `ids_only`。
+   - 开启 serial search。
+   - 重点确认 recall。
+   - 得到最干净的 BM25 baseline。
+2. 再跑 `text`。
+   - 可以跳过 serial recall。
+   - 重点看 concurrent QPS 和 latency。
+   - 对比 text payload 带来的吞吐下降。
+
+原因是：
+
+- recall 的核心验证是 doc id 是否匹配 ground truth。
+- text payload 主要测字段读取和响应体开销。
+- 如果同一个索引已经被 ids_only 验证过，text payload run 可以专注于并发性能。
+
+### 11.19 FTS 输出指标
+
+FTS case 的结果至少包含：
+
+| 指标 | 含义 |
+| --- | --- |
+| `inserted_count` | 成功插入的文档数量 |
+| `insert_duration` | 文档插入耗时 |
+| `optimize_duration` | 全文索引准备耗时 |
+| `load_duration` | insert + optimize 总耗时 |
+| `recall` | BM25 结果和数学 ground truth 的一致性 |
+| `serial_latency_p99` | 串行文本查询 p99 |
+| `serial_latency_p95` | 串行文本查询 p95 |
+| `qps` | 最大并发 QPS |
+| `conc_qps_list` | 每个并发档位的 QPS |
+| `conc_latency_p99_list` | 每个并发档位的 p99 |
+| `conc_latency_p95_list` | 每个并发档位的 p95 |
+| `payload_profile` | `ids_only` 或 `text` |
+| `payload_estimated_bytes_per_query` | 按 topK 估算的响应大小 |
+| `additional_parameters.fts_manifest` | BM25 和 analyzer manifest |
+
+### 11.20 FTS case 的测试任务拆解
+
+如果把 `FTSBm25Performance` 拆成测试任务单，可以这样写。
+
+| 任务 | 目标 | 成功标准 |
+| --- | --- | --- |
+| 数据准备 | 正确加载 text corpus、query、GT | query 数量和 GT 行数一致 |
+| manifest 校验 | 确认 BM25/analyzer contract | doc_count、query_count、source dataset 对齐 |
+| 插入文档 | 测 text insert 成本 | inserted_count 达到 case size |
+| 构建索引 | 测 full text index readiness | optimize 不超时 |
+| 串行搜索 | 测 BM25 正确性和单查询延迟 | recall 达标，p99 可接受 |
+| 并发搜索 | 测 BM25 吞吐 | QPS 随 concurrency 上升到稳定峰值 |
+| payload 对比 | 测返回文本字段成本 | text payload 的 QPS drop 可解释 |
+
+### 11.21 常用命令形态
+
+Milvus FTS，小规模 MS MARCO，只返回 ID：
+
+```bash
+vectordbbench milvusfts \
+  --case-type FTSBm25Performance \
+  --dataset-with-size-type "MS MARCO Small (100K documents)" \
+  --uri "$MILVUS_URI" \
+  --payload-profile ids_only \
+  --load-concurrency 0 \
+  --num-concurrency 40,80 \
+  --task-label fts-milvus-msmarco-small-ids
+```
+
+HotpotQA 中规模，返回文本字段，偏并发吞吐：
+
+```bash
+vectordbbench milvusfts \
+  --case-type FTSBm25Performance \
+  --dataset-with-size-type "HotpotQA Medium (1M documents)" \
+  --uri "$MILVUS_URI" \
+  --payload-profile text \
+  --skip-search-serial \
+  --num-concurrency 40,80 \
+  --concurrency-duration 30 \
+  --task-label fts-milvus-hotpotqa-medium-text
+```
+
+### 11.22 结果解读
+
+**recall 高**
+
+说明 backend 返回结果和 declared BM25/analyzer contract 生成的数学 ground truth 一致。它不等于人工相关性高，也不代表 RAG 最终答案好。
+
+**recall 低**
+
+优先检查：
+
+- analyzer 是否一致。
+- tokenizer 是否一致。
+- lowercase / stop words / stemming 是否一致。
+- BM25 `k1` / `b` / `avgdl` 是否应用。
+- doc id 是否和 dense row id 对齐。
+- topK 是否一致。
+
+**load duration 高**
+
+可能是：
+
+- 文本写入慢。
+- tokenizer 成本高。
+- 倒排索引构建慢。
+- backend refresh / merge / compaction 慢。
+- 对象存储或磁盘 IO 慢。
+
+**optimize duration 高**
+
+可能是：
+
+- posting list merge 慢。
+- force merge 慢。
+- 全文索引 ready 慢。
+- 后台 index deployment 慢。
+
+**ids_only QPS 高但 text QPS 低**
+
+说明 BM25 scorer 可能不是瓶颈，瓶颈可能在：
+
+- stored field 读取。
+- 文本字段反序列化。
+- 网络传输。
+- client 解析响应。
+
+**p99 高**
+
+可能是：
+
+- 热词 query 的 posting list 很长。
+- 部分 query 命中文档过多。
+- 字段返回大小差异大。
+- 后端 segment / shard 分布不均。
+- merge / compaction 干扰。
+
+### 11.23 FTS case 的常见误区
+
+**误区 1: 把 BM25 recall 当成人工相关性**
+
+FTS recall 只说明结果是否符合数学 BM25 ground truth。它不回答“这个文档对用户是否真的相关”。
+
+**误区 2: 忽略 analyzer**
+
+BM25 的结果高度依赖 analyzer。分词、大小写、停用词、词干化、字段长度归一化都会影响排名。
+
+**误区 3: 不记录未应用参数**
+
+如果 backend 不支持某些 BM25 参数，VectorDBBench 可能只能记录它们未应用。比较结果时必须说明。
+
+**误区 4: 把 text payload 慢归因于搜索慢**
+
+text payload 慢可能是字段读取或网络传输慢，不一定是倒排检索慢。
+
+**误区 5: 用 FTS 结果代表 hybrid search**
+
+FTS case 只测 BM25 text-only 层。Hybrid search 还包含 dense/sparse 融合、score normalize、rerank 等额外路径。
+
+### 11.24 针对 Milvus 的 FTS 排查重点
+
+如果用 `milvusfts` 跑这个 case，建议重点看：
+
+- 全文索引创建是否成功。
+- analyzer 参数是否和 manifest 对齐。
+- BM25 参数是否实际应用。
+- Tantivy index build 耗时。
+- text 字段写入和存储成本。
+- QueryNode 上 BM25 查询耗时。
+- 返回 text payload 时 Proxy / QueryNode 的序列化和网络成本。
+- sealed segment 数量是否过多。
+- index load 是否完成。
+- 是否存在 cold cache 导致的首轮抖动。
+
+Milvus 结果分析建议：
+
+- 先用 `ids_only` 确认 BM25 recall。
+- 再用 `text` payload 测真实响应体成本。
+- 如果 recall 异常，先排 analyzer/manifest，不要直接调 query 并发。
+- 如果 QPS 异常，拆开看 query 执行、字段读取和网络返回。
+ 
+### 11.25 FTS case 结论应该怎么写
+
+一份 FTS benchmark 结论至少写清楚：
+
+- CaseType: `FTSBm25Performance`
+- dataset-with-size-type
+- 文档数
+- query 数
+- topK
+- payload_profile
+- backend analyzer 设置
+- manifest analyzer 设置
+- BM25 `k1` / `b` / `avgdl`
+- 哪些 BM25/analyzer 参数已应用
+- 哪些参数未应用
+- inserted_count
+- insert_duration
+- optimize_duration
+- load_duration
+- recall
+- serial p95 / p99
+- concurrent QPS
+- concurrent p95 / p99
+- text payload 与 ids_only 的 QPS 差异
+
+缺少这些上下文时，FTS 结果很难和其他数据库或其他版本公平比较。
 
 ## 12. 指标含义速查
 
