@@ -5,6 +5,17 @@ THIRD_PARTY_DIR=$SCRIPTS_DIR/../cmake_build/thirdparty
 API_VERSION=$(go list -m github.com/milvus-io/milvus-proto/go-api/v3 | awk -F' ' '{print $2}')
 PROTO_REPO=https://github.com/milvus-io/milvus-proto.git
 
+if [[ "${MILVUS_PROTO_OFFLINE:-0}" == "1" ]]; then
+  if [ ! -d "$THIRD_PARTY_DIR/milvus-proto/proto" ]; then
+    echo "MILVUS_PROTO_OFFLINE=1 but $THIRD_PARTY_DIR/milvus-proto/proto does not exist"
+    exit 1
+  fi
+
+  echo "MILVUS_PROTO_OFFLINE=1, skip milvus-proto network fetch"
+  echo "version: $API_VERSION"
+  exit 0
+fi
+
 # Try tagged version first.
 COMMIT_ID=$(git ls-remote "$PROTO_REPO" refs/tags/${API_VERSION} | cut -f 1)
 if [[ -z $COMMIT_ID ]]; then
