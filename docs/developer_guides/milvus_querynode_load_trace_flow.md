@@ -292,13 +292,15 @@ Milvus v2.4.5 的 load 元数据中没有独立的一等 `VA size` 字段。因�
 - index load dispatch、append index info 前、成功 update 后
 - delta log 读取前后，以及实际读取 bytes
 - PK statslog 或 storage v2 stats blob 读取
+- `querynode remote object fetch trace`: 记录 Go 侧直接通过 chunk manager 读
+  statslog、deltalog、legacy patch rowID binlog 的对象路径、类型、bytes 和耗时。
 
 新增 C++ 日志点：
 
 - `DownloadAndDecodeRemoteFile`: 记录 storage v1 对象 path 和 `Size(file)` 返回
-  的对象大小。
+  的对象大小，并输出统一的 `querynode remote object fetch trace`。
 - `DownloadAndDecodeRemoteFileV2`: 记录 storage v2 blob 名称和
-  `GetBlobByteSize` 返回的大小。
+  `GetBlobByteSize` 返回的大小，并输出统一的 `querynode remote object fetch trace`。
 - `SegmentSealedImpl::LoadFieldData`: 记录非 mmap 字段列对象的
   `segment_id`、`field_id`、`segment_length_bytes`、`column_byte_size`、
   `source_bytes`、`data_va` 和 `mmap_va`。
@@ -307,7 +309,55 @@ Milvus v2.4.5 的 load 元数据中没有独立的一等 `VA size` 字段。因�
 - `ChunkCache::Mmap`: 记录 chunk cache 从远端对象解码并 mmap 到本地后的
   cache file、数据类型、行数、长度和 VA 地址。
 
-## 6. 建议排查方式
+`querynode remote object fetch trace` 的关键字段：
+
+- `event`: `size_done`、`read_begin`、`read_done`、`decode_done`。
+- `storage_version`: `v1` 或 `v2`。
+- `remote_kind`: `segment`、`index`、`stats`、`delta`、`raw_data` 或 `unknown`。
+- `remote_path`: MinIO/object storage 对象路径。
+- `encoded_bytes`: 对象存储读取或元数据 size。
+- `decoded_bytes`: segcore 解码后的 payload size，仅 `decode_done` 有值。
+- `duration_ms`: 单对象 size/read/decode 耗时；Go `MultiRead` 批量读取会额外记录
+  `batch_duration_ms`。
+- `collection_id`、`partition_id`、`segment_id`、`field_id`、`log_id`、
+  `build_id`、`index_version`: 从标准 Milvus 对象路径中解析出的关联字段。
+
+## 6. 统计解析脚本
+
+脚本位置：
+
+```bash
+tools/querynode_trace/analyze_minio_trace.py
+```
+
+示例：
+
+```bash
+python tools/querynode_trace/analyze_minio_trace.py "/var/log/milvus/querynode*.log" --top 20 --csv-prefix /tmp/qn_minio
+```
+
+脚本会解析：
+
+- 本次新增的 `querynode remote object fetch trace`，用于统计真实从 MinIO/object
+  storage 读取 segment、index、stats、delta、raw data 的对象数量、bytes、p50/p95
+  size、p95 耗时和吞吐。
+- 上次 commit 已有的 `loadObjectSummary`，作为计划加载对象数量和元数据大小统计。
+- 上次 commit 已有的 `segcore download object from remote storage` 和
+  `segcore download storage v2 blob from remote storage`，作为旧格式兼容统计。
+- `querynode segment field data va trace` 和 `querynode chunk cache mmap va trace`，
+  用于汇总已加载字段或 chunk cache 的 VA length。
+
+统计口径：
+
+- 实际对象读取优先使用 `event=read_done`。
+- 旧格式日志没有 read 耗时，只能统计对象 size，脚本标记为 legacy。
+- `decode_done` 单独统计解码后 payload bytes、行数和数据类型，不与 object
+  read bytes 混算。
+- `loadObjectSummary` 来自 QueryNode/DataCoord 元数据，是计划加载量；如果它和
+  `read_done` 的实际值差异明显，应继续检查 lazy load、chunk cache、索引 mmap、
+  DataCoord 元数据新鲜度和对象存储一致性。
+
+## 7. 建议排查方式
 
 常用过滤关键词：
 
@@ -317,6 +367,7 @@ Milvus v2.4.5 的 load 元数据中没有独立的一等 `VA size` 字段。因�
 - `querynode load index from remote storage`
 - `querynode load delta logs from remote storage`
 - `querynode load storage v2 segment data from remote storage`
+- `querynode remote object fetch trace`
 - `segcore download object from remote storage`
 - `segcore download storage v2 blob from remote storage`
 - `querynode segment field data va trace`

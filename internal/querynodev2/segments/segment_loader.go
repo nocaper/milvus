@@ -1368,9 +1368,27 @@ func (loader *segmentLoader) loadBloomFilter(ctx context.Context, segmentID int6
 		zap.Strings("binlogPaths", binlogPaths),
 		zap.Int("statsLogNum", len(binlogPaths)),
 		zap.String("statsLogType", fmt.Sprint(logType)))
+	for _, binlogPath := range binlogPaths {
+		logRemoteObjectFetchTrace(ctx, "read_begin", "v1", binlogPath, 0, 0,
+			zap.String("caller", "loadBloomFilter"),
+			zap.String("stats_log_type", fmt.Sprint(logType)),
+			zap.Int("batch_object_count", len(binlogPaths)))
+	}
+	readStart := time.Now()
 	values, err := loader.cm.MultiRead(ctx, binlogPaths)
 	if err != nil {
 		return err
+	}
+	readDuration := time.Since(readStart)
+	for idx, value := range values {
+		if idx >= len(binlogPaths) {
+			break
+		}
+		logRemoteObjectFetchTrace(ctx, "read_done", "v1", binlogPaths[idx], int64(len(value)), 0,
+			zap.String("caller", "loadBloomFilter"),
+			zap.String("stats_log_type", fmt.Sprint(logType)),
+			zap.Int("batch_object_count", len(binlogPaths)),
+			zap.Float64("batch_duration_ms", float64(readDuration.Microseconds())/1000))
 	}
 	blobs := []*storage.Blob{}
 	for i := 0; i < len(values); i++ {
@@ -1432,10 +1450,19 @@ func (loader *segmentLoader) LoadDeltaLogs(ctx context.Context, segment Segment,
 				continue
 			}
 			future := GetLoadPool().Submit(func() (any, error) {
+				logRemoteObjectFetchTrace(ctx, "read_begin", "v1", bLog.GetLogPath(), bLog.GetLogSize(), 0,
+					zap.String("caller", "LoadDeltaLogs"),
+					zap.Int64("entry_count", bLog.GetEntriesNum()),
+					zap.Int64("memory_size", bLog.GetMemorySize()))
+				readStart := time.Now()
 				value, err := loader.cm.Read(ctx, bLog.GetLogPath())
 				if err != nil {
 					return nil, err
 				}
+				logRemoteObjectFetchTrace(ctx, "read_done", "v1", bLog.GetLogPath(), int64(len(value)), time.Since(readStart),
+					zap.String("caller", "LoadDeltaLogs"),
+					zap.Int64("entry_count", bLog.GetEntriesNum()),
+					zap.Int64("memory_size", bLog.GetMemorySize()))
 				blob := &storage.Blob{
 					Key:   bLog.GetLogPath(),
 					Value: value,
@@ -1505,10 +1532,21 @@ func (loader *segmentLoader) patchEntryNumber(ctx context.Context, segment *Loca
 	counts := make([]int64, 0, len(rowIDField.GetBinlogs()))
 	for _, binlog := range rowIDField.GetBinlogs() {
 		// binlog.LogPath has already been filled
+		logRemoteObjectFetchTrace(ctx, "read_begin", "v1", binlog.LogPath, binlog.GetLogSize(), 0,
+			zap.String("caller", "patchEntryNumber"),
+			zap.Int64("rowid_field_id", rowIDField.GetFieldID()),
+			zap.Int64("entry_count", binlog.GetEntriesNum()),
+			zap.Int64("memory_size", binlog.GetMemorySize()))
+		readStart := time.Now()
 		bs, err := loader.cm.Read(ctx, binlog.LogPath)
 		if err != nil {
 			return err
 		}
+		logRemoteObjectFetchTrace(ctx, "read_done", "v1", binlog.LogPath, int64(len(bs)), time.Since(readStart),
+			zap.String("caller", "patchEntryNumber"),
+			zap.Int64("rowid_field_id", rowIDField.GetFieldID()),
+			zap.Int64("entry_count", binlog.GetEntriesNum()),
+			zap.Int64("memory_size", binlog.GetMemorySize()))
 
 		// get binlog entry num from rowID field
 		// since header does not store entry numb, we have to read all data here

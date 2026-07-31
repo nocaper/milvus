@@ -19,6 +19,9 @@ package segments
 import (
 	"context"
 	"path"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/samber/lo"
 	"go.uber.org/zap"
@@ -83,12 +86,123 @@ type segmentLoadTraceSummary struct {
 	VASizeLabel        string             `json:"va_size_label,omitempty"`
 }
 
+type remoteObjectPathTrace struct {
+	RemoteKind    string
+	CollectionID  int64
+	PartitionID   int64
+	SegmentID     int64
+	FieldID       int64
+	LogID         int64
+	BuildID       int64
+	IndexVersion  int64
+	PathBase      string
+}
+
 func mib(size int64) float64 {
 	return float64(size) / 1024 / 1024
 }
 
 func mibUint(size uint64) float64 {
 	return float64(size) / 1024 / 1024
+}
+
+func parseTraceInt64(value string) int64 {
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return -1
+	}
+	return parsed
+}
+
+func parseRemoteObjectPathForTrace(remotePath string) remoteObjectPathTrace {
+	trace := remoteObjectPathTrace{
+		RemoteKind:   "unknown",
+		CollectionID: -1,
+		PartitionID:  -1,
+		SegmentID:    -1,
+		FieldID:      -1,
+		LogID:        -1,
+		BuildID:      -1,
+		IndexVersion: -1,
+		PathBase:     path.Base(remotePath),
+	}
+	parts := strings.Split(remotePath, "/")
+	for i, part := range parts {
+		switch part {
+		case common.SegmentInsertLogPath:
+			if i+5 < len(parts) {
+				trace.RemoteKind = "segment"
+				trace.CollectionID = parseTraceInt64(parts[i+1])
+				trace.PartitionID = parseTraceInt64(parts[i+2])
+				trace.SegmentID = parseTraceInt64(parts[i+3])
+				trace.FieldID = parseTraceInt64(parts[i+4])
+				trace.LogID = parseTraceInt64(parts[i+5])
+				return trace
+			}
+		case common.SegmentStatslogPath:
+			if i+5 < len(parts) {
+				trace.RemoteKind = "stats"
+				trace.CollectionID = parseTraceInt64(parts[i+1])
+				trace.PartitionID = parseTraceInt64(parts[i+2])
+				trace.SegmentID = parseTraceInt64(parts[i+3])
+				trace.FieldID = parseTraceInt64(parts[i+4])
+				trace.LogID = parseTraceInt64(parts[i+5])
+				return trace
+			}
+		case common.SegmentDeltaLogPath:
+			if i+4 < len(parts) {
+				trace.RemoteKind = "delta"
+				trace.CollectionID = parseTraceInt64(parts[i+1])
+				trace.PartitionID = parseTraceInt64(parts[i+2])
+				trace.SegmentID = parseTraceInt64(parts[i+3])
+				trace.LogID = parseTraceInt64(parts[i+4])
+				return trace
+			}
+		case common.SegmentIndexPath:
+			if i+4 < len(parts) {
+				trace.RemoteKind = "index"
+				trace.BuildID = parseTraceInt64(parts[i+1])
+				trace.IndexVersion = parseTraceInt64(parts[i+2])
+				trace.PartitionID = parseTraceInt64(parts[i+3])
+				trace.SegmentID = parseTraceInt64(parts[i+4])
+				return trace
+			}
+		case "raw_datas":
+			if i+2 < len(parts) {
+				trace.RemoteKind = "raw_data"
+				trace.SegmentID = parseTraceInt64(parts[i+1])
+				trace.FieldID = parseTraceInt64(parts[i+2])
+				if i+3 < len(parts) {
+					trace.LogID = parseTraceInt64(parts[i+3])
+				}
+				return trace
+			}
+		}
+	}
+	return trace
+}
+
+func logRemoteObjectFetchTrace(ctx context.Context, event string, storageVersion string, remotePath string, encodedBytes int64, duration time.Duration, fields ...zap.Field) {
+	trace := parseRemoteObjectPathForTrace(remotePath)
+	log.Ctx(ctx).Info("querynode remote object fetch trace",
+		append([]zap.Field{
+			zap.String("event", event),
+			zap.String("storage_version", storageVersion),
+			zap.String("remote_kind", trace.RemoteKind),
+			zap.String("remote_path", remotePath),
+			zap.String("path_base", trace.PathBase),
+			zap.Int64("collection_id", trace.CollectionID),
+			zap.Int64("partition_id", trace.PartitionID),
+			zap.Int64("segment_id", trace.SegmentID),
+			zap.Int64("field_id", trace.FieldID),
+			zap.Int64("log_id", trace.LogID),
+			zap.Int64("build_id", trace.BuildID),
+			zap.Int64("index_version", trace.IndexVersion),
+			zap.Int64("encoded_bytes", encodedBytes),
+			zap.Float64("encoded_bytes_mib", mib(encodedBytes)),
+			zap.Float64("duration_ms", float64(duration.Microseconds())/1000),
+		}, fields...)...,
+	)
 }
 
 func summarizeFieldBinlogs(fields []*datapb.FieldBinlog) binlogTraceSummary {

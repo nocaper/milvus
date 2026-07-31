@@ -15,7 +15,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include "arrow/array/builder_binary.h"
 #include "arrow/type_fwd.h"
@@ -45,6 +52,148 @@
 #include "storage/DiskFileManagerImpl.h"
 
 namespace milvus::storage {
+
+namespace {
+
+struct RemoteObjectPathInfo {
+    std::string remote_kind = "unknown";
+    int64_t collection_id = -1;
+    int64_t partition_id = -1;
+    int64_t segment_id = -1;
+    int64_t field_id = -1;
+    int64_t log_id = -1;
+    int64_t build_id = -1;
+    int64_t index_version = -1;
+    std::string path_base;
+};
+
+std::vector<std::string>
+split_path(const std::string& path) {
+    std::vector<std::string> parts;
+    std::stringstream ss(path);
+    std::string part;
+    while (std::getline(ss, part, '/')) {
+        if (!part.empty()) {
+            parts.emplace_back(std::move(part));
+        }
+    }
+    return parts;
+}
+
+bool
+parse_int64(const std::string& value, int64_t& parsed) {
+    try {
+        size_t pos = 0;
+        parsed = std::stoll(value, &pos);
+        return pos == value.size();
+    } catch (...) {
+        return false;
+    }
+}
+
+RemoteObjectPathInfo
+parse_remote_object_path(const std::string& path) {
+    RemoteObjectPathInfo info;
+    auto parts = split_path(path);
+    if (parts.empty()) {
+        return info;
+    }
+    info.path_base = parts.back();
+
+    for (size_t i = 0; i < parts.size(); ++i) {
+        const auto& part = parts[i];
+        if ((part == "insert_log" || part == "stats_log") &&
+            i + 5 < parts.size()) {
+            info.remote_kind = part == "insert_log" ? "segment" : "stats";
+            parse_int64(parts[i + 1], info.collection_id);
+            parse_int64(parts[i + 2], info.partition_id);
+            parse_int64(parts[i + 3], info.segment_id);
+            parse_int64(parts[i + 4], info.field_id);
+            parse_int64(parts[i + 5], info.log_id);
+            return info;
+        }
+        if (part == "delta_log" && i + 4 < parts.size()) {
+            info.remote_kind = "delta";
+            parse_int64(parts[i + 1], info.collection_id);
+            parse_int64(parts[i + 2], info.partition_id);
+            parse_int64(parts[i + 3], info.segment_id);
+            parse_int64(parts[i + 4], info.log_id);
+            return info;
+        }
+        if (part == INDEX_ROOT_PATH && i + 4 < parts.size()) {
+            info.remote_kind = "index";
+            parse_int64(parts[i + 1], info.build_id);
+            parse_int64(parts[i + 2], info.index_version);
+            parse_int64(parts[i + 3], info.partition_id);
+            parse_int64(parts[i + 4], info.segment_id);
+            return info;
+        }
+        if (part == RAWDATA_ROOT_PATH && i + 2 < parts.size()) {
+            info.remote_kind = "raw_data";
+            parse_int64(parts[i + 1], info.segment_id);
+            parse_int64(parts[i + 2], info.field_id);
+            if (i + 3 < parts.size()) {
+                parse_int64(parts[i + 3], info.log_id);
+            }
+            return info;
+        }
+    }
+
+    return info;
+}
+
+int64_t
+duration_ms(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+}
+
+uintptr_t
+pointer_to_va(void* ptr) {
+    return reinterpret_cast<uintptr_t>(ptr);
+}
+
+void
+log_remote_object_event(const std::string& event,
+                        const std::string& storage_version,
+                        const std::string& file,
+                        const RemoteObjectPathInfo& info,
+                        int64_t encoded_bytes,
+                        int64_t decoded_bytes,
+                        int64_t row_count,
+                        int64_t dim,
+                        DataType data_type,
+                        uintptr_t data_va,
+                        int64_t elapsed_ms) {
+    LOG_INFO(
+        "querynode remote object fetch trace, event={}, storage_version={}, "
+        "remote_kind={}, remote_path={}, path_base={}, collection_id={}, "
+        "partition_id={}, segment_id={}, field_id={}, log_id={}, build_id={}, "
+        "index_version={}, encoded_bytes={}, decoded_bytes={}, row_count={}, "
+        "dim={}, data_type={}, data_va=0x{:x}, duration_ms={}",
+        event,
+        storage_version,
+        info.remote_kind,
+        file,
+        info.path_base,
+        info.collection_id,
+        info.partition_id,
+        info.segment_id,
+        info.field_id,
+        info.log_id,
+        info.build_id,
+        info.index_version,
+        encoded_bytes,
+        decoded_bytes,
+        row_count,
+        dim,
+        static_cast<int>(data_type),
+        data_va,
+        elapsed_ms);
+}
+
+}  // namespace
 
 std::map<std::string, ChunkManagerType> ChunkManagerType_Map = {
     {"local", ChunkManagerType::Local},
@@ -469,19 +618,78 @@ GetSegmentRawDataPathPrefix(ChunkManagerPtr cm, int64_t segment_id) {
 std::unique_ptr<DataCodec>
 DownloadAndDecodeRemoteFile(ChunkManager* chunk_manager,
                             const std::string& file) {
+    auto info = parse_remote_object_path(file);
+    auto size_start = std::chrono::steady_clock::now();
     auto fileSize = chunk_manager->Size(file);
+    auto fileSizeBytes = static_cast<int64_t>(fileSize);
     LOG_INFO("segcore download object from remote storage, file={}, size={}",
              file,
              fileSize);
+    log_remote_object_event("size_done",
+                            "v1",
+                            file,
+                            info,
+                            fileSizeBytes,
+                            0,
+                            0,
+                            0,
+                            DataType::NONE,
+                            0,
+                            duration_ms(size_start));
     auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize]);
-    chunk_manager->Read(file, buf.get(), fileSize);
+    log_remote_object_event("read_begin",
+                            "v1",
+                            file,
+                            info,
+                            fileSizeBytes,
+                            0,
+                            0,
+                            0,
+                            DataType::NONE,
+                            0,
+                            0);
+    auto read_start = std::chrono::steady_clock::now();
+    auto readBytes = chunk_manager->Read(file, buf.get(), fileSize);
+    auto readBytesSize = static_cast<int64_t>(readBytes);
+    log_remote_object_event("read_done",
+                            "v1",
+                            file,
+                            info,
+                            readBytesSize,
+                            0,
+                            0,
+                            0,
+                            DataType::NONE,
+                            0,
+                            duration_ms(read_start));
 
-    return DeserializeFileData(buf, fileSize);
+    auto decode_start = std::chrono::steady_clock::now();
+    auto codec = DeserializeFileData(buf, fileSize);
+    auto field_data = codec->GetFieldData();
+    auto decoded_bytes = field_data ? field_data->Size() : 0;
+    auto row_count = field_data ? static_cast<int64_t>(field_data->get_num_rows()) : 0;
+    auto dim = field_data ? field_data->get_dim() : 0;
+    auto data_type = field_data ? field_data->get_data_type() : DataType::NONE;
+    auto data_va = field_data ? pointer_to_va(field_data->Data()) : 0;
+    log_remote_object_event("decode_done",
+                            "v1",
+                            file,
+                            info,
+                            fileSizeBytes,
+                            decoded_bytes,
+                            row_count,
+                            dim,
+                            data_type,
+                            data_va,
+                            duration_ms(decode_start));
+    return codec;
 }
 
 std::unique_ptr<DataCodec>
 DownloadAndDecodeRemoteFileV2(std::shared_ptr<milvus_storage::Space> space,
                               const std::string& file) {
+    auto info = parse_remote_object_path(file);
+    auto size_start = std::chrono::steady_clock::now();
     auto fileSize = space->GetBlobByteSize(file);
     if (!fileSize.ok()) {
         PanicInfo(FileReadFailed, fileSize.status().ToString());
@@ -490,13 +698,67 @@ DownloadAndDecodeRemoteFileV2(std::shared_ptr<milvus_storage::Space> space,
              "size={}",
              file,
              fileSize.value());
+    auto fileSizeBytes = static_cast<int64_t>(fileSize.value());
+    log_remote_object_event("size_done",
+                            "v2",
+                            file,
+                            info,
+                            fileSizeBytes,
+                            0,
+                            0,
+                            0,
+                            DataType::NONE,
+                            0,
+                            duration_ms(size_start));
     auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize.value()]);
+    log_remote_object_event("read_begin",
+                            "v2",
+                            file,
+                            info,
+                            fileSizeBytes,
+                            0,
+                            0,
+                            0,
+                            DataType::NONE,
+                            0,
+                            0);
+    auto read_start = std::chrono::steady_clock::now();
     auto status = space->ReadBlob(file, buf.get());
     if (!status.ok()) {
         PanicInfo(FileReadFailed, status.ToString());
     }
+    log_remote_object_event("read_done",
+                            "v2",
+                            file,
+                            info,
+                            fileSizeBytes,
+                            0,
+                            0,
+                            0,
+                            DataType::NONE,
+                            0,
+                            duration_ms(read_start));
 
-    return DeserializeFileData(buf, fileSize.value());
+    auto decode_start = std::chrono::steady_clock::now();
+    auto codec = DeserializeFileData(buf, fileSize.value());
+    auto field_data = codec->GetFieldData();
+    auto decoded_bytes = field_data ? field_data->Size() : 0;
+    auto row_count = field_data ? static_cast<int64_t>(field_data->get_num_rows()) : 0;
+    auto dim = field_data ? field_data->get_dim() : 0;
+    auto data_type = field_data ? field_data->get_data_type() : DataType::NONE;
+    auto data_va = field_data ? pointer_to_va(field_data->Data()) : 0;
+    log_remote_object_event("decode_done",
+                            "v2",
+                            file,
+                            info,
+                            fileSizeBytes,
+                            decoded_bytes,
+                            row_count,
+                            dim,
+                            data_type,
+                            data_va,
+                            duration_ms(decode_start));
+    return codec;
 }
 
 std::pair<std::string, size_t>
