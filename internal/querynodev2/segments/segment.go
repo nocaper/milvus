@@ -913,23 +913,34 @@ func (s *LocalSegment) LoadMultiFieldData(ctx context.Context) error {
 
 		loadFieldDataInfo.appendMMapDirPath(paramtable.Get().QueryNodeCfg.MmapDirPath.GetValue())
 	}
+	logMultiFieldLoadTrace(ctx, s, rowCount, fields, "before-submit")
 
 	var status C.CStatus
-	GetLoadPool().Submit(func() (any, error) {
+	_, err = GetLoadPool().Submit(func() (any, error) {
 		if paramtable.Get().CommonCfg.EnableStorageV2.GetAsBool() {
 			uri, err := typeutil_internal.GetStorageURI(paramtable.Get().CommonCfg.StorageScheme.GetValue(), paramtable.Get().CommonCfg.StoragePathPrefix.GetValue(), s.ID())
 			if err != nil {
 				return nil, err
 			}
 
+			storageVersion, ok := storageV2CurrentVersion(s)
+			if !ok {
+				return nil, fmt.Errorf("storage v2 space is nil for segment %d", s.ID())
+			}
 			loadFieldDataInfo.appendURI(uri)
-			loadFieldDataInfo.appendStorageVersion(s.space.GetCurrentVersion())
+			loadFieldDataInfo.appendStorageVersion(storageVersion)
+			logStorageV2Trace(ctx, s, "load-multi-field-data", uri, storageVersion,
+				zap.Int64("rowCount", rowCount),
+				zap.Any("binlogSummary", summarizeFieldBinlogs(fields)))
 			status = C.LoadFieldDataV2(s.ptr, loadFieldDataInfo.cLoadFieldDataInfo)
 		} else {
 			status = C.LoadFieldData(s.ptr, loadFieldDataInfo.cLoadFieldDataInfo)
 		}
 		return nil, nil
 	}).Await()
+	if err != nil {
+		return err
+	}
 	if err := HandleCStatus(ctx, &status, "LoadMultiFieldData failed",
 		zap.Int64("collectionID", s.Collection()),
 		zap.Int64("partitionID", s.Partition()),
@@ -940,6 +951,7 @@ func (s *LocalSegment) LoadMultiFieldData(ctx context.Context) error {
 	log.Info("load mutil field done",
 		zap.Int64("row count", rowCount),
 		zap.Int64("segmentID", s.ID()))
+	logMultiFieldLoadTrace(ctx, s, rowCount, fields, "after-load")
 
 	return nil
 }
@@ -987,9 +999,10 @@ func (s *LocalSegment) LoadFieldData(ctx context.Context, fieldID int64, rowCoun
 		(!common.FieldHasMmapKey(collection.Schema(), fieldID) && params.Params.QueryNodeCfg.MmapEnabled.GetAsBool())
 	loadFieldDataInfo.appendMMapDirPath(paramtable.Get().QueryNodeCfg.MmapDirPath.GetValue())
 	loadFieldDataInfo.enableMmap(fieldID, mmapEnabled)
+	logFieldLoadTrace(ctx, s, fieldID, rowCount, field, mmapEnabled, "before-submit")
 
 	var status C.CStatus
-	GetLoadPool().Submit(func() (any, error) {
+	_, err = GetLoadPool().Submit(func() (any, error) {
 		log.Info("submitted loadFieldData task to load pool")
 		if paramtable.Get().CommonCfg.EnableStorageV2.GetAsBool() {
 			uri, err := typeutil_internal.GetStorageURI(paramtable.Get().CommonCfg.StorageScheme.GetValue(), paramtable.Get().CommonCfg.StoragePathPrefix.GetValue(), s.ID())
@@ -997,14 +1010,26 @@ func (s *LocalSegment) LoadFieldData(ctx context.Context, fieldID int64, rowCoun
 				return nil, err
 			}
 
+			storageVersion, ok := storageV2CurrentVersion(s)
+			if !ok {
+				return nil, fmt.Errorf("storage v2 space is nil for segment %d", s.ID())
+			}
 			loadFieldDataInfo.appendURI(uri)
-			loadFieldDataInfo.appendStorageVersion(s.space.GetCurrentVersion())
+			loadFieldDataInfo.appendStorageVersion(storageVersion)
+			logStorageV2Trace(ctx, s, "load-field-data", uri, storageVersion,
+				zap.Int64("fieldID", fieldID),
+				zap.Int64("rowCount", rowCount),
+				zap.Bool("mmapEnabled", mmapEnabled),
+				zap.Any("binlogSummary", summarizeFieldBinlogs([]*datapb.FieldBinlog{field})))
 			status = C.LoadFieldDataV2(s.ptr, loadFieldDataInfo.cLoadFieldDataInfo)
 		} else {
 			status = C.LoadFieldData(s.ptr, loadFieldDataInfo.cLoadFieldDataInfo)
 		}
 		return nil, nil
 	}).Await()
+	if err != nil {
+		return err
+	}
 	if err := HandleCStatus(ctx, &status, "LoadFieldData failed",
 		zap.Int64("collectionID", s.Collection()),
 		zap.Int64("partitionID", s.Partition()),
@@ -1014,11 +1039,17 @@ func (s *LocalSegment) LoadFieldData(ctx context.Context, fieldID int64, rowCoun
 	}
 
 	log.Info("load field done")
+	logFieldLoadTrace(ctx, s, fieldID, rowCount, field, mmapEnabled, "after-load")
 
 	return nil
 }
 
 func (s *LocalSegment) LoadDeltaData2(ctx context.Context, schema *schemapb.CollectionSchema) error {
+	storageVersion, ok := storageV2CurrentVersion(s)
+	if !ok {
+		return fmt.Errorf("storage v2 space is nil for segment %d", s.ID())
+	}
+	logStorageV2Trace(ctx, s, "scan-delete", "", storageVersion)
 	deleteReader, err := s.space.ScanDelete()
 	if err != nil {
 		return err
@@ -1104,6 +1135,8 @@ func (s *LocalSegment) LoadDeltaData2(ctx context.Context, schema *schemapb.Coll
 	log.Info("load deleted record done",
 		zap.Int("rowNum", len(tss)),
 		zap.String("segmentType", s.Type().String()))
+	logStorageV2Trace(ctx, s, "load-delete-done", "", storageVersion,
+		zap.Int("rowNum", len(tss)))
 	return nil
 }
 
@@ -1140,6 +1173,7 @@ func (s *LocalSegment) AddFieldDataInfo(ctx context.Context, rowCount int64, fie
 			}
 		}
 	}
+	logMultiFieldLoadTrace(ctx, s, rowCount, fields, "add-field-data-info")
 
 	var status C.CStatus
 	GetLoadPool().Submit(func() (any, error) {
@@ -1268,10 +1302,16 @@ func (s *LocalSegment) LoadIndex(ctx context.Context, indexInfo *querypb.FieldIn
 			return err
 		}
 		loadIndexInfo.appendStorageInfo(uri, indexInfo.IndexStoreVersion)
+		logStorageV2Trace(ctx, s, "load-index", uri, indexInfo.GetIndexStoreVersion(),
+			zap.Int64("fieldID", indexInfo.GetFieldID()),
+			zap.Int64("indexID", indexInfo.GetIndexID()),
+			zap.Int64("buildID", indexInfo.GetBuildID()),
+			zap.Any("indexSummary", summarizeIndexes([]*querypb.FieldIndexInfo{indexInfo})))
 	}
 	newLoadIndexInfoSpan := tr.RecordSpan()
 
 	// 2.
+	logIndexLoadTrace(ctx, s, indexInfo, fieldType.String(), "before-append-index-info")
 	err = loadIndexInfo.appendLoadIndexInfo(ctx, indexInfo, s.Collection(), s.Partition(), s.ID(), fieldType)
 	if err != nil {
 		if loadIndexInfo.cleanLocalData(ctx) != nil {
@@ -1294,6 +1334,16 @@ func (s *LocalSegment) LoadIndex(ctx context.Context, indexInfo *querypb.FieldIn
 	}
 	updateIndexInfoSpan := tr.RecordSpan()
 	if !typeutil.IsVectorType(fieldType) || s.HasRawData(indexInfo.GetFieldID()) {
+		log.Info("Finish loading index",
+			zap.Duration("newLoadIndexInfoSpan", newLoadIndexInfoSpan),
+			zap.Duration("appendLoadIndexInfoSpan", appendLoadIndexInfoSpan),
+			zap.Duration("updateIndexInfoSpan", updateIndexInfoSpan),
+		)
+		logIndexLoadTrace(ctx, s, indexInfo, fieldType.String(), "after-load-index",
+			zap.Duration("newLoadIndexInfoSpan", newLoadIndexInfoSpan),
+			zap.Duration("appendLoadIndexInfoSpan", appendLoadIndexInfoSpan),
+			zap.Duration("updateIndexInfoSpan", updateIndexInfoSpan),
+			zap.Bool("warmupChunkCache", false))
 		return nil
 	}
 
@@ -1304,8 +1354,14 @@ func (s *LocalSegment) LoadIndex(ctx context.Context, indexInfo *querypb.FieldIn
 		zap.Duration("newLoadIndexInfoSpan", newLoadIndexInfoSpan),
 		zap.Duration("appendLoadIndexInfoSpan", appendLoadIndexInfoSpan),
 		zap.Duration("updateIndexInfoSpan", updateIndexInfoSpan),
-		zap.Duration("updateIndexInfoSpan", warmupChunkCacheSpan),
+		zap.Duration("warmupChunkCacheSpan", warmupChunkCacheSpan),
 	)
+	logIndexLoadTrace(ctx, s, indexInfo, fieldType.String(), "after-load-index",
+		zap.Duration("newLoadIndexInfoSpan", newLoadIndexInfoSpan),
+		zap.Duration("appendLoadIndexInfoSpan", appendLoadIndexInfoSpan),
+		zap.Duration("updateIndexInfoSpan", updateIndexInfoSpan),
+		zap.Duration("warmupChunkCacheSpan", warmupChunkCacheSpan),
+		zap.Bool("warmupChunkCache", true))
 	return nil
 }
 

@@ -15,10 +15,18 @@
 // limitations under the License.
 
 #include "ChunkCache.h"
+
+#include <cstdint>
+
 #include "common/Types.h"
 #include "mmap/Utils.h"
 
 namespace milvus::storage {
+
+static inline uintptr_t
+pointer_to_va(const char* ptr) {
+    return reinterpret_cast<uintptr_t>(ptr);
+}
 
 std::shared_ptr<ColumnBase>
 ChunkCache::Read(const std::string& filepath) {
@@ -117,6 +125,20 @@ ChunkCache::Mmap(const std::filesystem::path& path,
     } else {
         column = std::make_shared<Column>(file, data_size, dim, data_type);
     }
+
+    LOG_INFO(
+        "querynode chunk cache mmap va trace, cache_file={}, data_type={}, "
+        "dim={}, rows={}, segment_length_bytes={}, column_byte_size={}, "
+        "source_bytes={}, data_va=0x{:x}, mmap_va=0x{:x}",
+        path.string(),
+        static_cast<int>(data_type),
+        dim,
+        field_data->get_num_rows(),
+        column->ByteSize(),
+        column->ByteSize(),
+        data_size,
+        pointer_to_va(column->Data()),
+        pointer_to_va(column->MmappedData()));
 
     // unlink
     auto ok = unlink(path.c_str());

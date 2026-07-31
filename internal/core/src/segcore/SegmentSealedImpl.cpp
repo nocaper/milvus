@@ -67,6 +67,50 @@ get_bit(const BitsetType& bitset, FieldId field_id) {
     return bitset[pos];
 }
 
+static inline uintptr_t
+pointer_to_va(const char* ptr) {
+    return reinterpret_cast<uintptr_t>(ptr);
+}
+
+static inline size_t
+segment_length_bytes(DataType data_type,
+                     const ColumnBase& column,
+                     size_t source_bytes) {
+    auto column_bytes = column.ByteSize();
+    if (column_bytes == 0 && IsSparseFloatVectorDataType(data_type)) {
+        return source_bytes;
+    }
+    return column_bytes;
+}
+
+static inline void
+log_field_data_va_trace(int64_t segment_id,
+                        FieldId field_id,
+                        DataType data_type,
+                        int64_t expected_rows,
+                        const ColumnBase& column,
+                        std::string_view load_mode,
+                        size_t source_bytes,
+                        std::string_view mmap_file) {
+    LOG_INFO(
+        "querynode segment field data va trace, segment_id={}, field_id={}, "
+        "data_type={}, load_mode={}, expected_rows={}, column_rows={}, "
+        "segment_length_bytes={}, column_byte_size={}, source_bytes={}, "
+        "data_va=0x{:x}, mmap_va=0x{:x}, mmap_file={}",
+        segment_id,
+        field_id.get(),
+        static_cast<int>(data_type),
+        load_mode,
+        expected_rows,
+        column.NumRows(),
+        segment_length_bytes(data_type, column, source_bytes),
+        column.ByteSize(),
+        source_bytes,
+        pointer_to_va(column.Data()),
+        pointer_to_va(column.MmappedData()),
+        mmap_file);
+}
+
 void
 SegmentSealedImpl::LoadIndex(const LoadIndexInfo& info) {
     // print(info);
@@ -381,6 +425,7 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
         //                   "field data can't be loaded when indexing exists");
 
         std::shared_ptr<ColumnBase> column{};
+        size_t source_data_size = 0;
         if (IsVariableDataType(data_type)) {
             int64_t field_data_size = 0;
             switch (data_type) {
@@ -391,6 +436,7 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                             num_rows, field_meta);
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
+                        source_data_size += field_data->Size();
                         var_column->Append(std::move(field_data));
                     }
                     var_column->Seal();
@@ -406,6 +452,7 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                             num_rows, field_meta);
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
+                        source_data_size += field_data->Size();
                         var_column->Append(std::move(field_data));
                     }
                     var_column->Seal();
@@ -419,6 +466,7 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                         std::make_shared<ArrayColumn>(num_rows, field_meta);
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
+                        source_data_size += field_data->Size();
                         for (auto i = 0; i < field_data->get_num_rows(); i++) {
                             auto rawValue = field_data->RawValue(i);
                             auto array =
@@ -440,6 +488,7 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                     auto col = std::make_shared<SparseFloatColumn>(field_meta);
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
+                        source_data_size += field_data->Size();
                         stats_.mem_size += field_data->Size();
                         col->AppendBatch(field_data);
                     }
@@ -459,6 +508,7 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
             column = std::make_shared<Column>(num_rows, field_meta);
             FieldDataPtr field_data;
             while (data.channel->pop(field_data)) {
+                source_data_size += field_data->Size();
                 column->AppendBatch(field_data);
 
                 stats_.mem_size += field_data->Size();
@@ -473,6 +523,15 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                                data.field_id,
                                column->NumRows(),
                                num_rows));
+
+        log_field_data_va_trace(this->get_segment_id(),
+                                field_id,
+                                data_type,
+                                num_rows,
+                                *column,
+                                "memory",
+                                source_data_size,
+                                "");
 
         {
             std::unique_lock lck(mutex_);
@@ -530,7 +589,9 @@ SegmentSealedImpl::MapFieldData(const FieldId field_id, FieldDataInfo& data) {
     std::vector<std::vector<uint64_t>> element_indices{};
     FieldDataPtr field_data;
     size_t total_written = 0;
+    size_t source_data_size = 0;
     while (data.channel->pop(field_data)) {
+        source_data_size += field_data->Size();
         auto written =
             WriteFieldData(file, data_type, field_data, element_indices);
 
@@ -592,6 +653,15 @@ SegmentSealedImpl::MapFieldData(const FieldId field_id, FieldDataInfo& data) {
     } else {
         column = std::make_shared<Column>(file, total_written, field_meta);
     }
+
+    log_field_data_va_trace(this->get_segment_id(),
+                            field_id,
+                            data_type,
+                            num_rows,
+                            *column,
+                            "mmap",
+                            source_data_size,
+                            filepath.string());
 
     {
         std::unique_lock lck(mutex_);

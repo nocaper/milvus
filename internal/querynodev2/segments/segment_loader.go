@@ -176,6 +176,9 @@ func (loader *segmentLoaderV2) Load(ctx context.Context,
 
 	// continue to wait other task done
 	log.Info("start loading...", zap.Int("segmentNum", len(segments)), zap.Int("afterFilter", len(infos)))
+	for _, info := range infos {
+		logSegmentLoadTrace(ctx, "querynode prepared storage v2 segment load from remote storage", info)
+	}
 
 	// Check memory & storage limit
 	requestResourceResult, err := loader.requestResource(ctx, infos...)
@@ -245,7 +248,14 @@ func (loader *segmentLoaderV2) Load(ctx context.Context,
 		loader.manager.Segment.Put(ctx, segmentType, segment)
 		newSegments.GetAndRemove(segmentID)
 		loaded.Insert(segmentID, segment)
-		log.Info("load segment done", zap.Int64("segmentID", segmentID))
+		segmentMemSize := segment.MemSize()
+		log.Info("load segment done",
+			zap.Int64("segmentID", segmentID),
+			zap.Int64("segmentMemSize", segmentMemSize),
+			zap.Float64("segmentMemSizeMiB", mib(segmentMemSize)))
+		logSegmentLoadTrace(ctx, "querynode finished storage v2 segment load from remote storage", loadInfo,
+			zap.Int64("segmentMemSize", segmentMemSize),
+			zap.Float64("segmentMemSizeMiB", mib(segmentMemSize)))
 		loader.notifyLoadFinish(loadInfo)
 
 		metrics.QueryNodeLoadSegmentLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(float64(tr.ElapseSpan().Milliseconds()))
@@ -356,8 +366,14 @@ func (loader *segmentLoaderV2) loadBloomFilter(ctx context.Context, segmentID in
 
 	statsBlobs := space.StatisticsBlobs()
 	blobs := []*storage.Blob{}
+	var statsBlobBytes int64
 
 	for _, statsBlob := range statsBlobs {
+		statsBlobBytes += int64(statsBlob.Size)
+		log.Info("querynode load storage v2 pk stats blob from remote storage",
+			zap.String("blobName", statsBlob.Name),
+			zap.Int("blobSize", statsBlob.Size),
+			zap.Int64("storageVersion", storeVersion))
 		blob := make([]byte, statsBlob.Size)
 		_, err := space.ReadBlob(statsBlob.Name, blob)
 		if err != nil && err != io.EOF {
@@ -385,7 +401,8 @@ func (loader *segmentLoaderV2) loadBloomFilter(ctx context.Context, segmentID in
 		size += stat.BF.Cap()
 		bfs.AddHistoricalStats(pkStat)
 	}
-	log.Info("Successfully load pk stats", zap.Duration("time", time.Since(startTs)), zap.Uint("size", size), zap.Int("BFNum", len(stats)))
+	log.Info("Successfully load pk stats", zap.Duration("time", time.Since(startTs)), zap.Uint("size", size), zap.Int("BFNum", len(stats)),
+		zap.Int("statsBlobNum", len(statsBlobs)), zap.Int64("statsBlobBytes", statsBlobBytes), zap.Float64("statsBlobBytesMiB", mib(statsBlobBytes)))
 	return nil
 }
 
@@ -418,6 +435,7 @@ func (loader *segmentLoaderV2) LoadSegment(ctx context.Context,
 	log.Info("start loading segment files",
 		zap.Int64("rowNum", loadInfo.GetNumOfRows()),
 		zap.String("segmentType", segment.Type().String()))
+	logSegmentLoadTrace(ctx, "querynode start storage v2 segment load from remote storage", loadInfo)
 
 	collection := loader.manager.Collection.Get(segment.Collection())
 	if collection == nil {
@@ -494,7 +512,15 @@ func (loader *segmentLoaderV2) LoadSegment(ctx context.Context,
 	}
 
 	log.Info("loading delta...")
-	return loader.LoadDelta(ctx, segment.Collection(), segment)
+	err = loader.LoadDelta(ctx, segment.Collection(), segment)
+	if err != nil {
+		return err
+	}
+	segmentMemSize := segment.MemSize()
+	logSegmentLoadTrace(ctx, "querynode storage v2 segment data loaded from remote storage", loadInfo,
+		zap.Int64("segmentMemSize", segmentMemSize),
+		zap.Float64("segmentMemSizeMiB", mib(segmentMemSize)))
+	return nil
 }
 
 func (loader *segmentLoaderV2) LoadLazySegment(ctx context.Context,
@@ -622,6 +648,9 @@ func (loader *segmentLoader) Load(ctx context.Context,
 
 	// continue to wait other task done
 	log.Info("start loading...", zap.Int("segmentNum", len(segments)), zap.Int("afterFilter", len(infos)))
+	for _, info := range infos {
+		logSegmentLoadTrace(ctx, "querynode prepared segment load from remote storage", info)
+	}
 
 	var err error
 	var requestResourceResult requestResourceResult
@@ -694,7 +723,10 @@ func (loader *segmentLoader) Load(ctx context.Context,
 			if err != nil {
 				logger.Warn("load segment failed when load data into memory", zap.Error(err))
 			}
-			logger.Info("load segment done")
+			segmentMemSize := segment.MemSize()
+			logger.Info("load segment done",
+				zap.Int64("segmentMemSize", segmentMemSize),
+				zap.Float64("segmentMemSizeMiB", mib(segmentMemSize)))
 		}()
 		tr := timerecord.NewTimeRecorder("loadDurationPerSegment")
 		logger.Info("load segment...")
@@ -716,6 +748,10 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		loader.manager.Segment.Put(ctx, segmentType, segment)
 		newSegments.GetAndRemove(segmentID)
 		loaded.Insert(segmentID, segment)
+		segmentMemSize := segment.MemSize()
+		logSegmentLoadTrace(ctx, "querynode finished segment load from remote storage", loadInfo,
+			zap.Int64("segmentMemSize", segmentMemSize),
+			zap.Float64("segmentMemSizeMiB", mib(segmentMemSize)))
 		loader.notifyLoadFinish(loadInfo)
 
 		metrics.QueryNodeLoadSegmentLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(float64(tr.ElapseSpan().Milliseconds()))
@@ -1031,6 +1067,7 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 
 	indexedFieldInfos, fieldBinlogs := separateIndexAndBinlog(loadInfo)
 	schemaHelper, _ := typeutil.CreateSchemaHelper(collection.Schema())
+	logSegmentLoadTrace(ctx, "querynode start sealed segment load from remote storage", loadInfo)
 	if err := segment.AddFieldDataInfo(ctx, loadInfo.GetNumOfRows(), loadInfo.GetBinlogPaths()); err != nil {
 		return err
 	}
@@ -1077,12 +1114,22 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 		return err
 	}
 	patchEntryNumberSpan := tr.RecordSpan()
+	segmentMemSize := segment.MemSize()
 	log.Info("Finish loading segment",
 		zap.Duration("loadFieldsIndexSpan", loadFieldsIndexSpan),
 		zap.Duration("complementScalarDataSpan", complementScalarDataSpan),
 		zap.Duration("loadRawDataSpan", loadRawDataSpan),
 		zap.Duration("patchEntryNumberSpan", patchEntryNumberSpan),
+		zap.Int64("segmentMemSize", segmentMemSize),
+		zap.Float64("segmentMemSizeMiB", mib(segmentMemSize)),
 	)
+	logSegmentLoadTrace(ctx, "querynode sealed segment data loaded from remote storage", loadInfo,
+		zap.Duration("loadFieldsIndexSpan", loadFieldsIndexSpan),
+		zap.Duration("complementScalarDataSpan", complementScalarDataSpan),
+		zap.Duration("loadRawDataSpan", loadRawDataSpan),
+		zap.Duration("patchEntryNumberSpan", patchEntryNumberSpan),
+		zap.Int64("segmentMemSize", segmentMemSize),
+		zap.Float64("segmentMemSizeMiB", mib(segmentMemSize)))
 	return nil
 }
 
@@ -1099,6 +1146,7 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 	log.Info("start loading segment files",
 		zap.Int64("rowNum", loadInfo.GetNumOfRows()),
 		zap.String("segmentType", segment.Type().String()))
+	logSegmentLoadTrace(ctx, "querynode start segment load from remote storage", loadInfo)
 
 	collection := loader.manager.Collection.Get(segment.Collection())
 	if collection == nil {
@@ -1131,6 +1179,10 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 			return err
 		}
 	}
+	segmentMemSize := segment.MemSize()
+	logSegmentLoadTrace(ctx, "querynode segment data loaded from remote storage", loadInfo,
+		zap.Int64("segmentMemSize", segmentMemSize),
+		zap.Float64("segmentMemSizeMiB", mib(segmentMemSize)))
 	return nil
 }
 
@@ -1245,6 +1297,8 @@ func (loader *segmentLoader) loadFieldsIndex(ctx context.Context,
 	for fieldID, fieldInfo := range indexedFieldInfos {
 		indexInfo := fieldInfo.IndexInfo
 		tr := timerecord.NewTimeRecorder("loadFieldIndex")
+		logIndexLoadTrace(ctx, segment, indexInfo, "", "before-load-field-index",
+			zap.Any("rawFieldBinlogSummary", summarizeFieldBinlogs([]*datapb.FieldBinlog{fieldInfo.FieldBinlog})))
 		err := loader.loadFieldIndex(ctx, segment, indexInfo)
 		loadFieldIndexSpan := tr.RecordSpan()
 		if err != nil {
@@ -1288,6 +1342,7 @@ func (loader *segmentLoader) loadFieldIndex(ctx context.Context, segment *LocalS
 	if err != nil {
 		return err
 	}
+	logIndexLoadTrace(ctx, segment, indexInfo, fieldType.String(), "dispatch-load-field-index")
 
 	collection := loader.manager.Collection.Get(segment.Collection())
 	if collection == nil {
@@ -1309,6 +1364,10 @@ func (loader *segmentLoader) loadBloomFilter(ctx context.Context, segmentID int6
 	}
 
 	startTs := time.Now()
+	log.Info("querynode read pk stats logs from remote storage",
+		zap.Strings("binlogPaths", binlogPaths),
+		zap.Int("statsLogNum", len(binlogPaths)),
+		zap.String("statsLogType", fmt.Sprint(logType)))
 	values, err := loader.cm.MultiRead(ctx, binlogPaths)
 	if err != nil {
 		return err
@@ -1343,7 +1402,11 @@ func (loader *segmentLoader) loadBloomFilter(ctx context.Context, segmentID int6
 		size += stat.BF.Cap()
 		bfs.AddHistoricalStats(pkStat)
 	}
-	log.Info("Successfully load pk stats", zap.Duration("time", time.Since(startTs)), zap.Uint("size", size))
+	loadedBytes := lo.SumBy(values, func(value []byte) int64 {
+		return int64(len(value))
+	})
+	log.Info("Successfully load pk stats", zap.Duration("time", time.Since(startTs)), zap.Uint("size", size),
+		zap.Int64("loadedBytes", loadedBytes), zap.Float64("loadedBytesMiB", mib(loadedBytes)))
 	return nil
 }
 
@@ -1355,6 +1418,7 @@ func (loader *segmentLoader) LoadDeltaLogs(ctx context.Context, segment Segment,
 		zap.Int("deltaNum", len(deltaLogs)),
 	)
 	log.Info("loading delta...")
+	logDeltaLoadTrace(ctx, segment, deltaLogs, "before-read-delta")
 
 	dCodec := storage.DeleteCodec{}
 	var blobs []*storage.Blob
@@ -1402,7 +1466,14 @@ func (loader *segmentLoader) LoadDeltaLogs(ctx context.Context, segment Segment,
 		return err
 	}
 
+	loadedBytes := lo.SumBy(blobs, func(blob *storage.Blob) int64 {
+		return int64(len(blob.Value))
+	})
 	log.Info("load delta logs done", zap.Int64("deleteCount", deltaData.RowCount))
+	logDeltaLoadTrace(ctx, segment, deltaLogs, "after-read-delta",
+		zap.Int64("deleteCount", deltaData.RowCount),
+		zap.Int64("loadedBytes", loadedBytes),
+		zap.Float64("loadedBytesMiB", mib(loadedBytes)))
 	return nil
 }
 
@@ -1540,6 +1611,7 @@ func (loader *segmentLoader) checkSegmentSize(ctx context.Context, segmentLoadIn
 			zap.Float64("diskUsage(MB)", toMB(usage.DiskSize)),
 			zap.Float64("memoryLoadFactor", factor.memoryUsageFactor),
 		)
+		logSegmentResourceTrace(ctx, loadInfo.GetCollectionID(), usage, loadInfo)
 		mmapFieldCount += usage.MmapFieldCount
 		predictDiskUsage += usage.DiskSize
 		predictMemUsage += usage.MemorySize
@@ -1693,6 +1765,9 @@ func (loader *segmentLoader) LoadIndex(ctx context.Context, segment *LocalSegmen
 	defer loader.freeRequest(requestResourceResult.Resource)
 
 	log.Info("segment loader start to load index", zap.Int("segmentNumAfterFilter", len(infos)))
+	for _, info := range infos {
+		logSegmentLoadTrace(ctx, "querynode prepared segment index load from remote storage", info)
+	}
 	metrics.QueryNodeLoadSegmentConcurrency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), "LoadIndex").Inc()
 	defer metrics.QueryNodeLoadSegmentConcurrency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), "LoadIndex").Dec()
 

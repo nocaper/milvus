@@ -470,6 +470,9 @@ std::unique_ptr<DataCodec>
 DownloadAndDecodeRemoteFile(ChunkManager* chunk_manager,
                             const std::string& file) {
     auto fileSize = chunk_manager->Size(file);
+    LOG_INFO("segcore download object from remote storage, file={}, size={}",
+             file,
+             fileSize);
     auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize]);
     chunk_manager->Read(file, buf.get(), fileSize);
 
@@ -483,6 +486,10 @@ DownloadAndDecodeRemoteFileV2(std::shared_ptr<milvus_storage::Space> space,
     if (!fileSize.ok()) {
         PanicInfo(FileReadFailed, fileSize.status().ToString());
     }
+    LOG_INFO("segcore download storage v2 blob from remote storage, blob={}, "
+             "size={}",
+             file,
+             fileSize.value());
     auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize.value()]);
     auto status = space->ReadBlob(file, buf.get());
     if (!status.ok()) {
