@@ -372,7 +372,7 @@ func (loader *segmentLoaderV2) loadBloomFilter(ctx context.Context, segmentID in
 		statsBlobBytes += int64(statsBlob.Size)
 		log.Info("querynode load storage v2 pk stats blob from remote storage",
 			zap.String("blobName", statsBlob.Name),
-			zap.Int("blobSize", statsBlob.Size),
+			zap.Int64("blobSize", statsBlob.Size),
 			zap.Int64("storageVersion", storeVersion))
 		blob := make([]byte, statsBlob.Size)
 		_, err := space.ReadBlob(statsBlob.Name, blob)
