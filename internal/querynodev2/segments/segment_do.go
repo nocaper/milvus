@@ -2,6 +2,7 @@ package segments
 
 import (
 	"context"
+	"time"
 
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -24,11 +25,16 @@ func doOnSegment(ctx context.Context, mgr *Manager, seg Segment, do doOnSegmentF
 		ctx, cancel := withLazyLoadTimeoutContext(ctx)
 		defer cancel()
 
+		accessStart := time.Now()
 		var missing bool
 		missing, err = mgr.DiskCache.Do(ctx, seg.ID(), do)
+		accessDuration := time.Since(accessStart)
+		waitCacheDuration := time.Duration(0)
 		if missing {
 			accessRecord.CacheMissing()
+			waitCacheDuration = accessDuration
 		}
+		logSegmentAccessPathTrace(ctx, "query", "lazy-access-done", seg, missing, accessDuration, waitCacheDuration, zap.Error(err))
 		if err != nil {
 			log.Ctx(ctx).Warn("failed to do query disk cache", zap.Int64("segID", seg.ID()), zap.Error(err))
 		}

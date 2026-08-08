@@ -85,6 +85,7 @@ type SearchRequest struct {
 	msgID             UniqueID
 	searchFieldID     UniqueID
 	mvccTimestamp     Timestamp
+	traceGroupSize    int64
 }
 
 func NewSearchRequest(ctx context.Context, collection *Collection, req *querypb.SearchRequest, placeholderGrp []byte) (*SearchRequest, error) {
@@ -141,6 +142,17 @@ func (req *SearchRequest) getNumOfQuery() int64 {
 
 func (req *SearchRequest) Plan() *SearchPlan {
 	return req.plan
+}
+
+func (req *SearchRequest) SetTraceGroupSize(groupSize int64) {
+	req.traceGroupSize = groupSize
+}
+
+func (req *SearchRequest) GetTraceGroupSize() int64 {
+	if req.traceGroupSize > 0 {
+		return req.traceGroupSize
+	}
+	return 1
 }
 
 func (req *SearchRequest) Delete() {

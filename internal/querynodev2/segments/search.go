@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -40,6 +41,9 @@ func searchSegments(ctx context.Context, mgr *Manager, segments []Segment, segTy
 	if segType == commonpb.SegmentState_Growing {
 		searchLabel = metrics.GrowingSegmentLabel
 	}
+	nq := searchReq.getNumOfQuery()
+	topK := searchReq.Plan().getTopK()
+	groupSize := searchReq.GetTraceGroupSize()
 
 	resultCh := make(chan *SearchResult, len(segments))
 	searcher := func(ctx context.Context, s Segment) error {
@@ -55,7 +59,7 @@ func searchSegments(ctx context.Context, mgr *Manager, segments []Segment, segTy
 		metrics.QueryNodeSQSegmentLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
 			metrics.SearchLabel, searchLabel).Observe(float64(elapsed))
 		metrics.QueryNodeSegmentSearchLatencyPerVector.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
-			metrics.SearchLabel, searchLabel).Observe(float64(elapsed) / float64(searchReq.getNumOfQuery()))
+			metrics.SearchLabel, searchLabel).Observe(float64(elapsed) / float64(nq))
 		return nil
 	}
 
@@ -82,11 +86,22 @@ func searchSegments(ctx context.Context, mgr *Manager, segments []Segment, segTy
 				ctx, cancel := withLazyLoadTimeoutContext(ctx)
 				defer cancel()
 
+				accessStart := time.Now()
 				var missing bool
 				missing, err = mgr.DiskCache.Do(ctx, seg.ID(), searcher)
+				accessDuration := time.Since(accessStart)
+				waitCacheDuration := time.Duration(0)
 				if missing {
 					accessRecord.CacheMissing()
+					waitCacheDuration = accessDuration
 				}
+				logSegmentAccessPathTrace(ctx, metrics.SearchLabel, "lazy-access-done", seg, missing, accessDuration, waitCacheDuration,
+					zap.Int64("msg_id", searchReq.msgID),
+					zap.Int64("search_field_id", searchReq.searchFieldID),
+					zap.Int64("nq", nq),
+					zap.Int64("top_k", topK),
+					zap.Int64("group_size", groupSize),
+					zap.Error(err))
 				if err != nil {
 					log.Warn("failed to do search for disk cache", zap.Int64("segID", seg.ID()), zap.Error(err))
 				}
@@ -124,6 +139,9 @@ func searchSegmentsStreamly(ctx context.Context,
 	streamReduce func(result *SearchResult) error,
 ) error {
 	searchLabel := metrics.SealedSegmentLabel
+	nq := searchReq.getNumOfQuery()
+	topK := searchReq.Plan().getTopK()
+	groupSize := searchReq.GetTraceGroupSize()
 	searchResultsToClear := make([]*SearchResult, 0)
 	var reduceMutex sync.Mutex
 	var sumReduceDuration atomic.Duration
@@ -148,7 +166,7 @@ func searchSegmentsStreamly(ctx context.Context,
 		metrics.QueryNodeSQSegmentLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
 			metrics.SearchLabel, searchLabel).Observe(float64(searchDuration))
 		metrics.QueryNodeSegmentSearchLatencyPerVector.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
-			metrics.SearchLabel, searchLabel).Observe(float64(searchDuration) / float64(searchReq.getNumOfQuery()))
+			metrics.SearchLabel, searchLabel).Observe(float64(searchDuration) / float64(nq))
 		return nil
 	}
 
@@ -172,11 +190,22 @@ func searchSegmentsStreamly(ctx context.Context,
 				ctx, cancel := withLazyLoadTimeoutContext(ctx)
 				defer cancel()
 
+				accessStart := time.Now()
 				var missing bool
 				missing, err = mgr.DiskCache.Do(ctx, seg.ID(), searcher)
+				accessDuration := time.Since(accessStart)
+				waitCacheDuration := time.Duration(0)
 				if missing {
 					accessRecord.CacheMissing()
+					waitCacheDuration = accessDuration
 				}
+				logSegmentAccessPathTrace(ctx, metrics.SearchLabel, "lazy-stream-access-done", seg, missing, accessDuration, waitCacheDuration,
+					zap.Int64("msg_id", searchReq.msgID),
+					zap.Int64("search_field_id", searchReq.searchFieldID),
+					zap.Int64("nq", nq),
+					zap.Int64("top_k", topK),
+					zap.Int64("group_size", groupSize),
+					zap.Error(err))
 				if err != nil {
 					log.Warn("failed to do search for disk cache", zap.Int64("segID", seg.ID()), zap.Error(err))
 				}

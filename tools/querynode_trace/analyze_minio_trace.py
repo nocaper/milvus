@@ -17,6 +17,7 @@ import re
 import statistics
 import sys
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -26,8 +27,13 @@ LEGACY_V1_MSG = "segcore download object from remote storage"
 LEGACY_V2_MSG = "segcore download storage v2 blob from remote storage"
 SEGMENT_VA_MSG = "querynode segment field data va trace"
 CHUNK_CACHE_VA_MSG = "querynode chunk cache mmap va trace"
+SEGMENT_ACCESS_TRACE_MSG = "querynode segment access path trace"
+DISK_CACHE_LOAD_TRACE_MSG = "querynode disk cache load trace"
+REQUEST_TRACE_MSG = "querynode request path trace"
 
 PAIR_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^,]*)(?:,|$)")
+ISO_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}[T ][0-9:.]+(?:Z|[+-]\d{2}:?\d{2})?)")
+GLOG_TS_RE = re.compile(r"^[IWEF]\d{4}\s+([0-9:.]+)")
 
 
 def to_int(value: Any, default: int = 0) -> int:
@@ -51,8 +57,70 @@ def to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y"}:
+        return True
+    if text in {"false", "0", "no", "n"}:
+        return False
+    return default
+
+
 def mib(value: float) -> float:
     return value / 1024 / 1024
+
+
+def parse_timestamp_value(value: Any) -> Tuple[str, int]:
+    if value is None or value == "":
+        return "", 0
+    if isinstance(value, (int, float)):
+        # Zap JSON logs commonly use epoch seconds with fractional precision.
+        seconds = float(value)
+        return str(value), int(seconds * 1000)
+    text = str(value).strip()
+    if not text:
+        return "", 0
+    try:
+        seconds = float(text)
+        return text, int(seconds * 1000)
+    except ValueError:
+        pass
+    normalized = text.replace("Z", "+00:00")
+    if re.match(r".*[+-]\d{4}$", normalized):
+        normalized = f"{normalized[:-2]}:{normalized[-2:]}"
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            return text, 0
+        return text, int(dt.timestamp() * 1000)
+    except ValueError:
+        return text, 0
+
+
+def extract_time_fields(record: Dict[str, Any], raw_line: str) -> Dict[str, Any]:
+    for key in ("ts", "time", "timestamp", "@timestamp", "T"):
+        if key in record:
+            raw, unix_ms = parse_timestamp_value(record.get(key))
+            if raw:
+                return {"log_ts": raw, "log_ts_unix_ms": unix_ms}
+    match = ISO_TS_RE.search(raw_line)
+    if match:
+        raw, unix_ms = parse_timestamp_value(match.group(1))
+        return {"log_ts": raw, "log_ts_unix_ms": unix_ms}
+    match = GLOG_TS_RE.search(raw_line)
+    if match:
+        return {"log_ts": match.group(1), "log_ts_unix_ms": 0}
+    return {"log_ts": "", "log_ts_unix_ms": 0}
+
+
+def add_time_fields(records: Sequence[Dict[str, Any]], source_record: Dict[str, Any], raw_line: str) -> None:
+    fields = extract_time_fields(source_record, raw_line)
+    for record in records:
+        record.update(fields)
 
 
 def parse_pairs(text: str) -> Dict[str, str]:
@@ -157,6 +225,7 @@ def make_remote_record(data: Dict[str, Any], source: str, line_no: int, legacy: 
         "log_id": to_int(merged.get("log_id", -1), -1),
         "build_id": to_int(merged.get("build_id", merged.get("buildID", -1)), -1),
         "index_version": to_int(merged.get("index_version", merged.get("indexVersion", -1)), -1),
+        "trace_id": str(merged.get("trace_id") or merged.get("traceID") or ""),
         "encoded_bytes": to_int(encoded, 0),
         "decoded_bytes": to_int(merged.get("decoded_bytes"), 0),
         "row_count": to_int(merged.get("row_count", merged.get("rowCount", 0)), 0),
@@ -171,15 +240,18 @@ def make_remote_record(data: Dict[str, Any], source: str, line_no: int, legacy: 
     return record
 
 
-def extract_records_from_json(data: Dict[str, Any], raw_line: str, source: str, line_no: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+def extract_records_from_json(data: Dict[str, Any], raw_line: str, source: str, line_no: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     msg = log_message(data, raw_line)
     remote_records: List[Dict[str, Any]] = []
     planned_records: List[Dict[str, Any]] = []
     va_records: List[Dict[str, Any]] = []
+    access_records: List[Dict[str, Any]] = []
+    request_records: List[Dict[str, Any]] = []
 
     if REMOTE_TRACE_MSG in msg:
         remote_records.append(make_remote_record(data, source, line_no))
-        return remote_records, planned_records, va_records
+        add_time_fields(remote_records, data, raw_line)
+        return remote_records, planned_records, va_records, access_records, request_records
 
     if LEGACY_V1_MSG in msg:
         remote_path = data.get("file") or data.get("remote_path") or ""
@@ -190,6 +262,7 @@ def extract_records_from_json(data: Dict[str, Any], raw_line: str, source: str, 
             "remote_path": remote_path,
             "encoded_bytes": size,
         }, source, line_no, legacy=True))
+        add_time_fields(remote_records, data, raw_line)
 
     if LEGACY_V2_MSG in msg:
         remote_path = data.get("blob") or data.get("remote_path") or ""
@@ -200,46 +273,65 @@ def extract_records_from_json(data: Dict[str, Any], raw_line: str, source: str, 
             "remote_path": remote_path,
             "encoded_bytes": size,
         }, source, line_no, legacy=True))
+        add_time_fields(remote_records, data, raw_line)
 
     if "loadObjectSummary" in data and isinstance(data["loadObjectSummary"], dict):
         planned_records.extend(extract_planned_summary(data, source, line_no, msg))
+        add_time_fields(planned_records, data, raw_line)
 
     if SEGMENT_VA_MSG in msg or CHUNK_CACHE_VA_MSG in msg:
         va_records.append(make_va_record(data, source, line_no, msg))
+        add_time_fields(va_records, data, raw_line)
 
-    return remote_records, planned_records, va_records
+    if SEGMENT_ACCESS_TRACE_MSG in msg or DISK_CACHE_LOAD_TRACE_MSG in msg:
+        access_records.append(make_access_record(data, source, line_no, msg))
+        add_time_fields(access_records, data, raw_line)
+
+    if REQUEST_TRACE_MSG in msg:
+        request_records.append(make_request_record(data, source, line_no, msg))
+        add_time_fields(request_records, data, raw_line)
+
+    return remote_records, planned_records, va_records, access_records, request_records
 
 
-def extract_records_from_text(line: str, source: str, line_no: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+def extract_records_from_text(line: str, source: str, line_no: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     remote_records: List[Dict[str, Any]] = []
     planned_records: List[Dict[str, Any]] = []
     va_records: List[Dict[str, Any]] = []
+    access_records: List[Dict[str, Any]] = []
+    request_records: List[Dict[str, Any]] = []
 
     if REMOTE_TRACE_MSG in line:
         payload = line.split(REMOTE_TRACE_MSG, 1)[1]
         if payload.startswith(","):
             payload = payload[1:]
-        remote_records.append(make_remote_record(parse_pairs(payload), source, line_no))
+        data = parse_pairs(payload)
+        remote_records.append(make_remote_record(data, source, line_no))
+        add_time_fields(remote_records, data, line)
 
     if LEGACY_V1_MSG in line:
         match = re.search(r"file=([^,]+),\s*size=(\d+)", line)
         if match:
-            remote_records.append(make_remote_record({
+            data = {
                 "event": "legacy_size_done",
                 "storage_version": "v1",
                 "remote_path": match.group(1),
                 "encoded_bytes": match.group(2),
-            }, source, line_no, legacy=True))
+            }
+            remote_records.append(make_remote_record(data, source, line_no, legacy=True))
+            add_time_fields(remote_records, data, line)
 
     if LEGACY_V2_MSG in line:
         match = re.search(r"blob=([^,]+),\s*size=(\d+)", line)
         if match:
-            remote_records.append(make_remote_record({
+            data = {
                 "event": "legacy_size_done",
                 "storage_version": "v2",
                 "remote_path": match.group(1),
                 "encoded_bytes": match.group(2),
-            }, source, line_no, legacy=True))
+            }
+            remote_records.append(make_remote_record(data, source, line_no, legacy=True))
+            add_time_fields(remote_records, data, line)
 
     if SEGMENT_VA_MSG in line:
         payload = line.split(SEGMENT_VA_MSG, 1)[1]
@@ -248,6 +340,7 @@ def extract_records_from_text(line: str, source: str, line_no: int) -> Tuple[Lis
         data = parse_pairs(payload)
         data["msg"] = SEGMENT_VA_MSG
         va_records.append(make_va_record(data, source, line_no, SEGMENT_VA_MSG))
+        add_time_fields(va_records, data, line)
 
     if CHUNK_CACHE_VA_MSG in line:
         payload = line.split(CHUNK_CACHE_VA_MSG, 1)[1]
@@ -256,8 +349,36 @@ def extract_records_from_text(line: str, source: str, line_no: int) -> Tuple[Lis
         data = parse_pairs(payload)
         data["msg"] = CHUNK_CACHE_VA_MSG
         va_records.append(make_va_record(data, source, line_no, CHUNK_CACHE_VA_MSG))
+        add_time_fields(va_records, data, line)
 
-    return remote_records, planned_records, va_records
+    if SEGMENT_ACCESS_TRACE_MSG in line:
+        payload = line.split(SEGMENT_ACCESS_TRACE_MSG, 1)[1]
+        if payload.startswith(","):
+            payload = payload[1:]
+        data = parse_pairs(payload)
+        data["msg"] = SEGMENT_ACCESS_TRACE_MSG
+        access_records.append(make_access_record(data, source, line_no, SEGMENT_ACCESS_TRACE_MSG))
+        add_time_fields(access_records, data, line)
+
+    if DISK_CACHE_LOAD_TRACE_MSG in line:
+        payload = line.split(DISK_CACHE_LOAD_TRACE_MSG, 1)[1]
+        if payload.startswith(","):
+            payload = payload[1:]
+        data = parse_pairs(payload)
+        data["msg"] = DISK_CACHE_LOAD_TRACE_MSG
+        access_records.append(make_access_record(data, source, line_no, DISK_CACHE_LOAD_TRACE_MSG))
+        add_time_fields(access_records, data, line)
+
+    if REQUEST_TRACE_MSG in line:
+        payload = line.split(REQUEST_TRACE_MSG, 1)[1]
+        if payload.startswith(","):
+            payload = payload[1:]
+        data = parse_pairs(payload)
+        data["msg"] = REQUEST_TRACE_MSG
+        request_records.append(make_request_record(data, source, line_no, REQUEST_TRACE_MSG))
+        add_time_fields(request_records, data, line)
+
+    return remote_records, planned_records, va_records, access_records, request_records
 
 
 def get_nested(summary: Dict[str, Any], key: str) -> Dict[str, Any]:
@@ -275,6 +396,7 @@ def extract_planned_summary(data: Dict[str, Any], source: str, line_no: int, msg
         "partition_id": to_int(data.get("partitionID", summary.get("partition_id", -1)), -1),
         "segment_id": to_int(data.get("segmentID", summary.get("segment_id", -1)), -1),
         "row_count": to_int(data.get("rowCount", summary.get("row_count", 0)), 0),
+        "trace_id": str(data.get("trace_id") or data.get("traceID") or ""),
         "storage_version": str(data.get("storageVersion", summary.get("storage_version", ""))),
     }
     result: List[Dict[str, Any]] = []
@@ -311,6 +433,7 @@ def make_va_record(data: Dict[str, Any], source: str, line_no: int, msg: str) ->
         "field_id": to_int(data.get("field_id", data.get("fieldID", -1)), -1),
         "load_mode": str(data.get("load_mode") or data.get("loadMode") or ""),
         "remote_kind": "chunk_cache" if CHUNK_CACHE_VA_MSG in msg else "segment",
+        "trace_id": str(data.get("trace_id") or data.get("traceID") or ""),
         "segment_length_bytes": to_int(data.get("segment_length_bytes"), 0),
         "column_byte_size": to_int(data.get("column_byte_size"), 0),
         "source_bytes": to_int(data.get("source_bytes"), 0),
@@ -318,6 +441,67 @@ def make_va_record(data: Dict[str, Any], source: str, line_no: int, msg: str) ->
         "data_va": str(data.get("data_va") or ""),
         "mmap_va": str(data.get("mmap_va") or ""),
         "mmap_file": str(data.get("mmap_file") or data.get("cache_file") or ""),
+    }
+
+
+def make_access_record(data: Dict[str, Any], source: str, line_no: int, msg: str) -> Dict[str, Any]:
+    return {
+        "source": source,
+        "line": line_no,
+        "msg": msg,
+        "trace_kind": "disk_cache_load" if DISK_CACHE_LOAD_TRACE_MSG in msg else "segment_access",
+        "event": str(data.get("event") or ""),
+        "operation": str(data.get("operation") or ""),
+        "trace_id": str(data.get("trace_id") or data.get("traceID") or ""),
+        "msg_id": to_int(data.get("msg_id", data.get("msgID", 0)), 0),
+        "nq": to_int(data.get("nq"), 0),
+        "top_k": to_int(data.get("top_k", data.get("topK", 0)), 0),
+        "group_size": to_int(data.get("group_size", data.get("groupSize", 1)), 1),
+        "search_field_id": to_int(data.get("search_field_id", data.get("searchFieldID", -1)), -1),
+        "collection_id": to_int(data.get("collection_id", data.get("collectionID", -1)), -1),
+        "partition_id": to_int(data.get("partition_id", data.get("partitionID", -1)), -1),
+        "segment_id": to_int(data.get("segment_id", data.get("segmentID", -1)), -1),
+        "segment_type": str(data.get("segment_type") or data.get("segmentType") or ""),
+        "level": str(data.get("level") or ""),
+        "row_count": to_int(data.get("row_count", data.get("rowCount", 0)), 0),
+        "database_name": str(data.get("database_name") or data.get("databaseName") or ""),
+        "resource_group": str(data.get("resource_group") or data.get("resourceGroup") or ""),
+        "is_lazy_load": to_bool(data.get("is_lazy_load", data.get("isLazyLoad")), False),
+        "cache_miss": to_bool(data.get("cache_miss", data.get("cacheMiss")), False),
+        "duration_ms": to_float(data.get("duration_ms"), 0.0),
+        "wait_cache_ms": to_float(data.get("wait_cache_ms"), 0.0),
+        "estimated_memory_bytes": to_int(data.get("estimated_memory_bytes"), 0),
+        "estimated_disk_bytes": to_int(data.get("estimated_disk_bytes"), 0),
+        "mmap_field_count": to_int(data.get("mmap_field_count"), 0),
+        "error": str(data.get("error") or data.get("err") or ""),
+    }
+
+
+def make_request_record(data: Dict[str, Any], source: str, line_no: int, msg: str) -> Dict[str, Any]:
+    return {
+        "source": source,
+        "line": line_no,
+        "msg": msg,
+        "event": str(data.get("event") or ""),
+        "operation": str(data.get("operation") or ""),
+        "entry": str(data.get("entry") or ""),
+        "trace_id": str(data.get("trace_id") or data.get("traceID") or ""),
+        "node_id": to_int(data.get("node_id", data.get("nodeID", -1)), -1),
+        "msg_id": to_int(data.get("msg_id", data.get("msgID", 0)), 0),
+        "collection_id": to_int(data.get("collection_id", data.get("collectionID", -1)), -1),
+        "db_id": to_int(data.get("db_id", data.get("dbID", -1)), -1),
+        "scope": str(data.get("scope") or ""),
+        "nq": to_int(data.get("nq"), 0),
+        "top_k": to_int(data.get("top_k", data.get("topK", 0)), 0),
+        "is_advanced": to_bool(data.get("is_advanced", data.get("isAdvanced")), False),
+        "channel_count": to_int(data.get("channel_count", data.get("channelCount", 0)), 0),
+        "segment_count": to_int(data.get("segment_count", data.get("segmentCount", 0)), 0),
+        "total_channel_num": to_int(data.get("total_channel_num", data.get("totalChannelNum", 0)), 0),
+        "output_field_count": to_int(data.get("output_field_count", data.get("outputFieldCount", 0)), 0),
+        "limit": to_int(data.get("limit"), 0),
+        "is_count": to_bool(data.get("is_count", data.get("isCount")), False),
+        "guarantee_timestamp": to_int(data.get("guarantee_timestamp", data.get("guaranteeTimestamp", 0)), 0),
+        "mvcc_timestamp": to_int(data.get("mvcc_timestamp", data.get("mvccTimestamp", 0)), 0),
     }
 
 
@@ -336,10 +520,12 @@ def iter_input_files(patterns: Sequence[str]) -> Iterable[Path]:
                 yield path
 
 
-def parse_logs(files: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], int]:
+def parse_logs(files: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], int]:
     remote_records: List[Dict[str, Any]] = []
     planned_records: List[Dict[str, Any]] = []
     va_records: List[Dict[str, Any]] = []
+    access_records: List[Dict[str, Any]] = []
+    request_records: List[Dict[str, Any]] = []
     line_count = 0
 
     for file_path in iter_input_files(files):
@@ -348,14 +534,16 @@ def parse_logs(files: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[Dict[st
                 line_count += 1
                 data = parse_json_line(line)
                 if data is not None:
-                    remote, planned, va = extract_records_from_json(data, line, str(file_path), line_no)
+                    remote, planned, va, access, request = extract_records_from_json(data, line, str(file_path), line_no)
                 else:
-                    remote, planned, va = extract_records_from_text(line, str(file_path), line_no)
+                    remote, planned, va, access, request = extract_records_from_text(line, str(file_path), line_no)
                 remote_records.extend(remote)
                 planned_records.extend(planned)
                 va_records.extend(va)
+                access_records.extend(access)
+                request_records.extend(request)
 
-    return remote_records, planned_records, va_records, line_count
+    return remote_records, planned_records, va_records, access_records, request_records, line_count
 
 
 def percentile(sorted_values: Sequence[float], pct: float) -> float:
@@ -453,10 +641,60 @@ def print_group_table(title: str, grouped: Dict[Tuple[Any, ...], List[Dict[str, 
         print(" | ".join(values))
 
 
-def print_report(remote_records: List[Dict[str, Any]], planned_records: List[Dict[str, Any]], va_records: List[Dict[str, Any]], line_count: int, top: int) -> None:
+def print_request_table(title: str, grouped: Dict[Tuple[Any, ...], List[Dict[str, Any]]], keys: Sequence[str], top: int) -> None:
+    print(f"\n{title}")
+    print("-" * len(title))
+    rows = []
+    for group_key, records in grouped.items():
+        segment_counts = [to_float(record.get("segment_count"), 0.0) for record in records]
+        rows.append((len(records), group_key, sum(segment_counts), statistics.fmean(segment_counts) if segment_counts else 0.0))
+    rows.sort(reverse=True, key=lambda item: item[0])
+    if not rows:
+        print("(no data)")
+        return
+    header = " | ".join([*keys, "count", "total_segments", "mean_segments"])
+    print(header)
+    print("-" * len(header))
+    for count, group_key, total_segments, mean_segments in rows[:top]:
+        values = [str(value) for value in group_key]
+        values.extend([str(count), f"{total_segments:.0f}", f"{mean_segments:.1f}"])
+        print(" | ".join(values))
+
+
+def max_group_size_by(records: Sequence[Dict[str, Any]], key: str) -> Dict[Any, int]:
+    result: Dict[Any, int] = {}
+    for record in records:
+        value = record.get(key)
+        if not value:
+            continue
+        group_size = max(to_int(record.get("group_size"), 1), 1)
+        result[value] = max(result.get(value, 0), group_size)
+    return result
+
+
+def print_report(remote_records: List[Dict[str, Any]], planned_records: List[Dict[str, Any]], va_records: List[Dict[str, Any]], access_records: List[Dict[str, Any]], request_records: List[Dict[str, Any]], line_count: int, top: int) -> None:
     read_records = [record for record in remote_records if record["event"] in {"read_done", "legacy_size_done"}]
     decoded_records = [record for record in remote_records if record["event"] == "decode_done"]
     new_read_records = [record for record in read_records if not record.get("legacy")]
+    lazy_access_records = [record for record in access_records if record.get("trace_kind") == "segment_access"]
+    disk_load_records = [record for record in access_records if record.get("trace_kind") == "disk_cache_load"]
+    access_trace_ids = {record.get("trace_id") for record in lazy_access_records if record.get("trace_id")}
+    miss_trace_ids = {record.get("trace_id") for record in lazy_access_records if record.get("trace_id") and record.get("cache_miss")}
+    search_request_records = [record for record in request_records if record.get("operation") == "search"]
+    search_rpc_records = [record for record in search_request_records if record.get("entry") == "search"]
+    search_worker_records = [record for record in search_request_records if record.get("entry") == "search_segments"]
+    query_request_records = [record for record in request_records if record.get("operation") == "query"]
+    search_miss_access_records = [
+        record for record in lazy_access_records
+        if record.get("operation") == "search" and record.get("cache_miss")
+    ]
+    search_denominator_records = search_rpc_records or search_worker_records or search_request_records
+    search_request_trace_ids = {record.get("trace_id") for record in search_denominator_records if record.get("trace_id")}
+    search_miss_trace_ids = {record.get("trace_id") for record in search_miss_access_records if record.get("trace_id")}
+    search_request_msg_ids = {record.get("msg_id") for record in search_denominator_records if record.get("msg_id")}
+    search_miss_msg_ids = {record.get("msg_id") for record in search_miss_access_records if record.get("msg_id")}
+    search_miss_trace_group_sizes = max_group_size_by(search_miss_access_records, "trace_id")
+    search_miss_msg_group_sizes = max_group_size_by(search_miss_access_records, "msg_id")
 
     print("QueryNode MinIO/Object Storage Trace Summary")
     print("===========================================")
@@ -467,6 +705,32 @@ def print_report(remote_records: List[Dict[str, Any]], planned_records: List[Dic
     print(f"decode_done_records: {len(decoded_records)}")
     print(f"planned_summary_records: {len(planned_records)}")
     print(f"va_records: {len(va_records)}")
+    print(f"access_records: {len(access_records)}")
+    print(f"request_records: {len(request_records)}")
+    print(f"search_request_records: {len(search_request_records)}")
+    print(f"search_rpc_request_records: {len(search_rpc_records)}")
+    print(f"search_worker_request_records: {len(search_worker_records)}")
+    print(f"query_request_records: {len(query_request_records)}")
+    print(f"lazy_segment_access_records: {len(lazy_access_records)}")
+    print(f"disk_cache_load_records: {len(disk_load_records)}")
+    print(f"lazy_access_trace_ids: {len(access_trace_ids)}")
+    print(f"cache_miss_trace_ids: {len(miss_trace_ids)}")
+    if access_trace_ids:
+        print(f"cache_miss_trace_id_ratio: {len(miss_trace_ids) / len(access_trace_ids):.4f}")
+    if search_request_trace_ids:
+        hit_trace_ids = search_request_trace_ids & search_miss_trace_ids
+        hit_trace_group_size = min(sum(search_miss_trace_group_sizes.get(trace_id, 0) for trace_id in search_request_trace_ids), len(search_request_trace_ids))
+        print(f"search_cache_miss_request_trace_ids: {len(hit_trace_ids)}")
+        print(f"search_cache_miss_request_trace_ratio: {len(hit_trace_ids) / len(search_request_trace_ids):.4f}")
+        print(f"search_cache_miss_request_trace_group_size_estimate: {hit_trace_group_size}")
+        print(f"search_cache_miss_request_trace_group_size_ratio: {hit_trace_group_size / len(search_request_trace_ids):.4f}")
+    if search_request_msg_ids:
+        hit_msg_ids = search_request_msg_ids & search_miss_msg_ids
+        hit_msg_group_size = min(sum(search_miss_msg_group_sizes.get(msg_id, 0) for msg_id in search_request_msg_ids), len(search_request_msg_ids))
+        print(f"search_cache_miss_request_msg_ids: {len(hit_msg_ids)}")
+        print(f"search_cache_miss_request_msg_ratio: {len(hit_msg_ids) / len(search_request_msg_ids):.4f}")
+        print(f"search_cache_miss_request_msg_group_size_estimate: {hit_msg_group_size}")
+        print(f"search_cache_miss_request_msg_group_size_ratio: {hit_msg_group_size / len(search_request_msg_ids):.4f}")
 
     if read_records:
         summary = summarize_group(read_records)
@@ -508,6 +772,22 @@ def print_report(remote_records: List[Dict[str, Any]], planned_records: List[Dic
         ]
         print_group_table("Loaded VA Length By Mode", group_by(va_as_records, ["remote_kind", "load_mode"]), ["remote_kind", "load_mode"], top)
 
+    if access_records:
+        access_as_records = [
+            {
+                "remote_kind": row["trace_kind"],
+                "operation": row["operation"],
+                "segment_id": row["segment_id"],
+                "encoded_bytes": row["estimated_disk_bytes"] or row["estimated_memory_bytes"],
+                "duration_ms": row["duration_ms"],
+            }
+            for row in access_records
+        ]
+        print_group_table("Segment Access / Cache Load By Kind", group_by(access_as_records, ["remote_kind", "operation"]), ["remote_kind", "operation"], top)
+
+    if request_records:
+        print_request_table("Request Records By Entry", group_by(request_records, ["operation", "entry"]), ["operation", "entry"], top)
+
 
 def write_csv(path: str, records: Sequence[Dict[str, Any]]) -> None:
     if not records:
@@ -523,17 +803,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze Milvus QueryNode MinIO/object-storage trace logs.")
     parser.add_argument("logs", nargs="+", help="Log file paths or glob patterns.")
     parser.add_argument("--top", type=int, default=20, help="Rows to show for grouped tables.")
-    parser.add_argument("--csv-prefix", help="Write remote/planned/va CSV files using this prefix.")
+    parser.add_argument("--csv-prefix", help="Write remote/planned/va/access/request CSV files using this prefix.")
     parser.add_argument("--json-out", help="Write parsed records as JSON.")
     args = parser.parse_args()
 
-    remote_records, planned_records, va_records, line_count = parse_logs(args.logs)
-    print_report(remote_records, planned_records, va_records, line_count, args.top)
+    remote_records, planned_records, va_records, access_records, request_records, line_count = parse_logs(args.logs)
+    print_report(remote_records, planned_records, va_records, access_records, request_records, line_count, args.top)
 
     if args.csv_prefix:
         write_csv(f"{args.csv_prefix}.remote.csv", remote_records)
         write_csv(f"{args.csv_prefix}.planned.csv", planned_records)
         write_csv(f"{args.csv_prefix}.va.csv", va_records)
+        write_csv(f"{args.csv_prefix}.access.csv", access_records)
+        write_csv(f"{args.csv_prefix}.request.csv", request_records)
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as handle:
@@ -541,6 +823,8 @@ def main() -> int:
                 "remote": remote_records,
                 "planned": planned_records,
                 "va": va_records,
+                "access": access_records,
+                "request": request_records,
             }, handle, ensure_ascii=False, indent=2)
 
     return 0

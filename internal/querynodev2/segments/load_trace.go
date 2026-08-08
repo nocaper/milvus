@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/internal/proto/datapb"
@@ -187,6 +188,7 @@ func logRemoteObjectFetchTrace(ctx context.Context, event string, storageVersion
 	log.Ctx(ctx).Info("querynode remote object fetch trace",
 		append([]zap.Field{
 			zap.String("event", event),
+			zap.String("trace_id", traceIDForTraceLog(ctx)),
 			zap.String("storage_version", storageVersion),
 			zap.String("remote_kind", trace.RemoteKind),
 			zap.String("remote_path", remotePath),
@@ -202,6 +204,61 @@ func logRemoteObjectFetchTrace(ctx context.Context, event string, storageVersion
 			zap.Float64("encoded_bytes_mib", mib(encodedBytes)),
 			zap.Float64("duration_ms", float64(duration.Microseconds())/1000),
 		}, fields...)...,
+	)
+}
+
+func segmentTraceFields(segment Segment) []zap.Field {
+	if segment == nil {
+		return nil
+	}
+	usage := segment.ResourceUsageEstimate()
+	return []zap.Field{
+		zap.Int64("collection_id", segment.Collection()),
+		zap.Int64("partition_id", segment.Partition()),
+		zap.Int64("segment_id", segment.ID()),
+		zap.String("segment_type", segment.Type().String()),
+		zap.String("level", segment.Level().String()),
+		zap.Int64("row_count", segment.InsertCount()),
+		zap.String("database_name", segment.DatabaseName()),
+		zap.String("resource_group", segment.ResourceGroup()),
+		zap.Bool("is_lazy_load", segment.IsLazyLoad()),
+		zap.Uint64("estimated_memory_bytes", usage.MemorySize),
+		zap.Uint64("estimated_disk_bytes", usage.DiskSize),
+		zap.Int("mmap_field_count", usage.MmapFieldCount),
+	}
+}
+
+func traceIDForTraceLog(ctx context.Context) string {
+	spanCtx := trace.SpanFromContext(ctx).SpanContext()
+	if spanCtx.HasTraceID() {
+		return spanCtx.TraceID().String()
+	}
+	return ""
+}
+
+func logSegmentAccessPathTrace(ctx context.Context, operation string, event string, segment Segment, cacheMiss bool, duration time.Duration, waitCache time.Duration, fields ...zap.Field) {
+	baseFields := append([]zap.Field{
+		zap.String("operation", operation),
+		zap.String("event", event),
+		zap.String("trace_id", traceIDForTraceLog(ctx)),
+		zap.Bool("cache_miss", cacheMiss),
+		zap.Float64("duration_ms", float64(duration.Microseconds())/1000),
+		zap.Float64("wait_cache_ms", float64(waitCache.Microseconds())/1000),
+	}, segmentTraceFields(segment)...)
+	log.Ctx(ctx).Info("querynode segment access path trace",
+		append(baseFields, fields...)...,
+	)
+}
+
+func logDiskCacheLoadTrace(ctx context.Context, event string, segment Segment, duration time.Duration, fields ...zap.Field) {
+	baseFields := append([]zap.Field{
+		zap.String("event", event),
+		zap.String("operation", "disk_cache_load"),
+		zap.String("trace_id", traceIDForTraceLog(ctx)),
+		zap.Float64("duration_ms", float64(duration.Microseconds())/1000),
+	}, segmentTraceFields(segment)...)
+	log.Ctx(ctx).Info("querynode disk cache load trace",
+		append(baseFields, fields...)...,
 	)
 }
 

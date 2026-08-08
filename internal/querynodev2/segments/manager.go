@@ -28,6 +28,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
@@ -193,8 +194,10 @@ func NewManager() *Manager {
 		_, err, _ := sf.Do(fmt.Sprint(segment.ID()), func() (nop interface{}, err error) {
 			cacheLoadRecord := metricsutil.NewCacheLoadRecord(getSegmentMetricLabel(segment))
 			cacheLoadRecord.WithBytes(segment.ResourceUsageEstimate().DiskSize)
+			loadStart := time.Now()
 			defer func() {
 				cacheLoadRecord.Finish(err)
+				logDiskCacheLoadTrace(ctx, "lazy-segment-load-done", segment, time.Since(loadStart), zap.Error(err))
 			}()
 
 			collection := manager.Collection.Get(segment.Collection())

@@ -644,6 +644,7 @@ func (node *QueryNode) SearchSegments(ctx context.Context, req *querypb.SearchRe
 		zap.String("channel", channel),
 		zap.String("scope", req.GetScope().String()),
 	)
+	logSearchRequestPathTrace(ctx, node.GetNodeID(), "search_segments", "request-start", req)
 	channelsMvcc := make(map[string]uint64)
 	for _, ch := range req.GetDmlChannels() {
 		channelsMvcc[ch] = req.GetReq().GetMvccTimestamp()
@@ -728,6 +729,7 @@ func (node *QueryNode) Search(ctx context.Context, req *querypb.SearchRequest) (
 		zap.Int64s("segmentIDs", req.GetSegmentIDs()),
 		zap.Uint64("guaranteeTimestamp", req.GetReq().GetGuaranteeTimestamp()),
 		zap.Uint64("mvccTimestamp", req.GetReq().GetMvccTimestamp()))
+	logSearchRequestPathTrace(ctx, node.GetNodeID(), "search", "request-start", req)
 
 	tr := timerecord.NewTimeRecorderWithTrace(ctx, "SearchRequest")
 
@@ -823,6 +825,7 @@ func (node *QueryNode) QuerySegments(ctx context.Context, req *querypb.QueryRequ
 		zap.String("channel", channel),
 		zap.String("scope", req.GetScope().String()),
 	)
+	logQueryRequestPathTrace(ctx, node.GetNodeID(), "query_segments", "request-start", req)
 
 	if err := node.lifetime.Add(merr.IsHealthy); err != nil {
 		resp.Status = merr.Status(err)
@@ -893,6 +896,7 @@ func (node *QueryNode) Query(ctx context.Context, req *querypb.QueryRequest) (*i
 		zap.Uint64("mvccTimestamp", req.GetReq().GetMvccTimestamp()),
 		zap.Bool("isCount", req.GetReq().GetIsCount()),
 	)
+	logQueryRequestPathTrace(ctx, node.GetNodeID(), "query", "request-start", req)
 	tr := timerecord.NewTimeRecorderWithTrace(ctx, "QueryRequest")
 
 	if err := node.lifetime.Add(merr.IsHealthy); err != nil {

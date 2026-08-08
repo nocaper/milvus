@@ -153,6 +153,7 @@ func (t *SearchTask) Execute() error {
 	if err != nil {
 		return err
 	}
+	searchReq.SetTraceGroupSize(int64(t.groupSize))
 	defer searchReq.Delete()
 
 	var (
@@ -441,6 +442,7 @@ func (t *StreamingSearchTask) Execute() error {
 	if err != nil {
 		return err
 	}
+	searchReq.SetTraceGroupSize(int64(t.groupSize))
 	defer searchReq.Delete()
 
 	// 1. search&&reduce or streaming-search&&streaming-reduce
