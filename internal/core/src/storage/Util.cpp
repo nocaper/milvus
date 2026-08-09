@@ -15,6 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>
 #include <memory>
 
 #include "arrow/array/builder_binary.h"
@@ -469,9 +470,18 @@ GetSegmentRawDataPathPrefix(ChunkManagerPtr cm, int64_t segment_id) {
 std::unique_ptr<DataCodec>
 DownloadAndDecodeRemoteFile(ChunkManager* chunk_manager,
                             const std::string& file) {
+    auto start = std::chrono::system_clock::now();
     auto fileSize = chunk_manager->Size(file);
     auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize]);
     chunk_manager->Read(file, buf.get(), fileSize);
+    auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now() - start)
+                          .count();
+    LOG_INFO(
+        "milvus_qps_path_object_io op=remote_download_decode_cpp path_kind=object_storage_io object_storage_path_hit=true path={} bytes={} latency_ms={} status=success",
+        file,
+        fileSize,
+        latency_ms);
 
     return DeserializeFileData(buf, fileSize);
 }
@@ -479,15 +489,41 @@ DownloadAndDecodeRemoteFile(ChunkManager* chunk_manager,
 std::unique_ptr<DataCodec>
 DownloadAndDecodeRemoteFileV2(std::shared_ptr<milvus_storage::Space> space,
                               const std::string& file) {
+    auto start = std::chrono::system_clock::now();
     auto fileSize = space->GetBlobByteSize(file);
     if (!fileSize.ok()) {
+        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now() - start)
+                              .count();
+        LOG_WARN(
+            "milvus_qps_path_object_io op=remote_read_storage_v2_cpp path_kind=object_storage_io object_storage_path_hit=true path={} bytes=0 latency_ms={} status=fail error={}",
+            file,
+            latency_ms,
+            fileSize.status().ToString());
         PanicInfo(FileReadFailed, fileSize.status().ToString());
     }
     auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize.value()]);
     auto status = space->ReadBlob(file, buf.get());
     if (!status.ok()) {
+        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now() - start)
+                              .count();
+        LOG_WARN(
+            "milvus_qps_path_object_io op=remote_read_storage_v2_cpp path_kind=object_storage_io object_storage_path_hit=true path={} bytes={} latency_ms={} status=fail error={}",
+            file,
+            fileSize.value(),
+            latency_ms,
+            status.ToString());
         PanicInfo(FileReadFailed, status.ToString());
     }
+    auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now() - start)
+                          .count();
+    LOG_INFO(
+        "milvus_qps_path_object_io op=remote_read_storage_v2_cpp path_kind=object_storage_io object_storage_path_hit=true path={} bytes={} latency_ms={} status=success",
+        file,
+        fileSize.value(),
+        latency_ms);
 
     return DeserializeFileData(buf, fileSize.value());
 }

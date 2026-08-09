@@ -21,6 +21,7 @@ import (
 	"context"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
@@ -44,6 +45,30 @@ const (
 	CloudProviderAzure   = "azure"
 	CloudProviderTencent = "tencent"
 )
+
+func logRemoteObjectIO(ctx context.Context, op string, bucketName string, objectName string, size int64, latency time.Duration, err error) {
+	status := metrics.SuccessLabel
+	if err != nil {
+		status = metrics.FailLabel
+	}
+	fields := []zap.Field{
+		zap.String("op", op),
+		zap.String("path_kind", "object_storage_io"),
+		zap.Bool("object_storage_path_hit", true),
+		zap.String("bucket", bucketName),
+		zap.String("path", objectName),
+		zap.Int64("bytes", size),
+		zap.Duration("latency", latency),
+		zap.Int64("latency_ms", latency.Milliseconds()),
+		zap.String("status", status),
+	}
+	if err != nil {
+		fields = append(fields, zap.Error(err))
+		log.Ctx(ctx).Warn("milvus_qps_path_object_io", fields...)
+		return
+	}
+	log.Ctx(ctx).Info("milvus_qps_path_object_io", fields...)
+}
 
 // ChunkObjectWalkFunc is the callback function for walking objects.
 // If return false, WalkWithObjects will stop.
@@ -147,7 +172,9 @@ func (mcm *RemoteChunkManager) Size(ctx context.Context, filePath string) (int64
 
 // Write writes the data to minio storage.
 func (mcm *RemoteChunkManager) Write(ctx context.Context, filePath string, content []byte) error {
+	start := time.Now()
 	err := mcm.putObject(ctx, mcm.bucketName, filePath, bytes.NewReader(content), int64(len(content)))
+	logRemoteObjectIO(ctx, "remote_write", mcm.bucketName, filePath, int64(len(content)), time.Since(start), err)
 	if err != nil {
 		log.Warn("failed to put object", zap.String("bucket", mcm.bucketName), zap.String("path", filePath), zap.Error(err))
 		return err
@@ -185,6 +212,7 @@ func (mcm *RemoteChunkManager) Exist(ctx context.Context, filePath string) (bool
 
 // Read reads the minio storage data if exists.
 func (mcm *RemoteChunkManager) Read(ctx context.Context, filePath string) ([]byte, error) {
+	start := time.Now()
 	var data []byte
 	err := retry.Do(ctx, func() error {
 		object, err := mcm.getObject(ctx, mcm.bucketName, filePath, int64(0), int64(0))
@@ -217,9 +245,11 @@ func (mcm *RemoteChunkManager) Read(ctx context.Context, filePath string) ([]byt
 		return nil
 	}, retry.Attempts(3), retry.RetryErr(merr.IsRetryableErr))
 	if err != nil {
+		logRemoteObjectIO(ctx, "remote_read", mcm.bucketName, filePath, int64(len(data)), time.Since(start), err)
 		return nil, err
 	}
 
+	logRemoteObjectIO(ctx, "remote_read", mcm.bucketName, filePath, int64(len(data)), time.Since(start), nil)
 	return data, nil
 }
 
@@ -243,12 +273,16 @@ func (mcm *RemoteChunkManager) Mmap(ctx context.Context, filePath string) (*mmap
 
 // ReadAt reads specific position data of minio storage if exists.
 func (mcm *RemoteChunkManager) ReadAt(ctx context.Context, filePath string, off int64, length int64) ([]byte, error) {
+	start := time.Now()
 	if off < 0 || length < 0 {
-		return nil, io.EOF
+		err := io.EOF
+		logRemoteObjectIO(ctx, "remote_read_at", mcm.bucketName, filePath, 0, time.Since(start), err)
+		return nil, err
 	}
 
 	object, err := mcm.getObject(ctx, mcm.bucketName, filePath, off, length)
 	if err != nil {
+		logRemoteObjectIO(ctx, "remote_read_at", mcm.bucketName, filePath, 0, time.Since(start), err)
 		log.Warn("failed to get object", zap.String("bucket", mcm.bucketName), zap.String("path", filePath), zap.Error(err))
 		return nil, err
 	}
@@ -257,10 +291,12 @@ func (mcm *RemoteChunkManager) ReadAt(ctx context.Context, filePath string, off 
 	data, err := read(object, length)
 	err = checkObjectStorageError(filePath, err)
 	if err != nil {
+		logRemoteObjectIO(ctx, "remote_read_at", mcm.bucketName, filePath, int64(len(data)), time.Since(start), err)
 		log.Warn("failed to read object", zap.String("bucket", mcm.bucketName), zap.String("path", filePath), zap.Error(err))
 		return nil, err
 	}
 	metrics.PersistentDataKvSize.WithLabelValues(metrics.DataGetLabel).Observe(float64(length))
+	logRemoteObjectIO(ctx, "remote_read_at", mcm.bucketName, filePath, int64(len(data)), time.Since(start), nil)
 	return data, nil
 }
 

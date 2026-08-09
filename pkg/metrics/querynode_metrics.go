@@ -267,6 +267,48 @@ var (
 			nodeIDLabelName,
 		})
 
+	QueryNodeQPSPathEventCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "qps_path_event_count",
+			Help:      "count of qps path profiling events grouped by whether they hit the DataNode-MinIO-QueryNode path",
+		}, []string{
+			nodeIDLabelName,
+			"op",
+			"path_hit",
+			"path_kind",
+			statusLabelName,
+		})
+
+	QueryNodeQPSPathLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "qps_path_latency",
+			Help:      "latency of qps path profiling events in milliseconds",
+			Buckets:   longTaskBuckets,
+		}, []string{
+			nodeIDLabelName,
+			"op",
+			"path_hit",
+			"path_kind",
+			statusLabelName,
+		})
+
+	QueryNodeQPSPathRemoteBytes = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "qps_path_remote_bytes",
+			Help:      "remote bytes associated with qps path profiling events",
+			Buckets:   prometheus.ExponentialBuckets(1024, 4, 12),
+		}, []string{
+			nodeIDLabelName,
+			"op",
+			"path_kind",
+		})
+
 	QueryNodeReadTaskUnsolveLen = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
@@ -734,6 +776,9 @@ func RegisterQueryNode(registry *prometheus.Registry) {
 	registry.MustRegister(QueryNodeSQSegmentLatencyInCore)
 	registry.MustRegister(QueryNodeReduceLatency)
 	registry.MustRegister(QueryNodeLoadSegmentLatency)
+	registry.MustRegister(QueryNodeQPSPathEventCount)
+	registry.MustRegister(QueryNodeQPSPathLatency)
+	registry.MustRegister(QueryNodeQPSPathRemoteBytes)
 	registry.MustRegister(QueryNodeReadTaskUnsolveLen)
 	registry.MustRegister(QueryNodeReadTaskReadyLen)
 	registry.MustRegister(QueryNodeReadTaskConcurrency)

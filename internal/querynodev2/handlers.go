@@ -251,6 +251,13 @@ func (node *QueryNode) queryChannel(ctx context.Context, req *querypb.QueryReque
 	latency := tr.ElapseSpan()
 	metrics.QueryNodeSQReqLatency.WithLabelValues(fmt.Sprint(node.GetNodeID()), metrics.QueryLabel, metrics.Leader).Observe(float64(latency.Milliseconds()))
 	metrics.QueryNodeSQCount.WithLabelValues(fmt.Sprint(node.GetNodeID()), metrics.QueryLabel, metrics.SuccessLabel, metrics.Leader).Inc()
+	segments.RecordQPSNoPathEvent(ctx, metrics.QueryLabel, latency, nil,
+		zap.Int64("collectionID", req.GetReq().GetCollectionID()),
+		zap.String("channel", channel),
+		zap.String("scope", req.GetScope().String()),
+		zap.Int64s("segmentIDs", req.GetSegmentIDs()),
+		zap.Int64("related_data_size", resp.GetCostAggregation().GetTotalRelatedDataSize()),
+	)
 	return resp, nil
 }
 
@@ -299,6 +306,12 @@ func (node *QueryNode) queryChannelStream(ctx context.Context, req *querypb.Quer
 		channel,
 		req.GetSegmentIDs(),
 	))
+	segments.RecordQPSNoPathEvent(ctx, "query_stream", tr.ElapseSpan(), nil,
+		zap.Int64("collectionID", req.GetReq().GetCollectionID()),
+		zap.String("channel", channel),
+		zap.String("scope", req.GetScope().String()),
+		zap.Int64s("segmentIDs", req.GetSegmentIDs()),
+	)
 
 	return nil
 }
@@ -405,6 +418,15 @@ func (node *QueryNode) searchChannel(ctx context.Context, req *querypb.SearchReq
 	metrics.QueryNodeSQCount.WithLabelValues(fmt.Sprint(node.GetNodeID()), metrics.SearchLabel, metrics.SuccessLabel, metrics.Leader).Inc()
 	metrics.QueryNodeSearchNQ.WithLabelValues(fmt.Sprint(node.GetNodeID())).Observe(float64(req.Req.GetNq()))
 	metrics.QueryNodeSearchTopK.WithLabelValues(fmt.Sprint(node.GetNodeID())).Observe(float64(req.Req.GetTopk()))
+	segments.RecordQPSNoPathEvent(ctx, metrics.SearchLabel, latency, nil,
+		zap.Int64("collectionID", req.GetReq().GetCollectionID()),
+		zap.String("channel", channel),
+		zap.String("scope", req.GetScope().String()),
+		zap.Int64s("segmentIDs", req.GetSegmentIDs()),
+		zap.Int64("nq", req.GetReq().GetNq()),
+		zap.Int64("topk", req.GetReq().GetTopk()),
+		zap.Int64("related_data_size", resp.GetCostAggregation().GetTotalRelatedDataSize()),
+	)
 	return resp, nil
 }
 

@@ -169,6 +169,13 @@ func (loader *segmentLoaderV2) Load(ctx context.Context,
 	infos := loader.prepare(ctx, segmentType, segments...)
 	defer loader.unregister(infos...)
 
+	preparedIDs := typeutil.NewSet(lo.Map(infos, func(s *querypb.SegmentLoadInfo, _ int) int64 { return s.GetSegmentID() })...)
+	for _, info := range segments {
+		if !preparedIDs.Contain(info.GetSegmentID()) {
+			RecordQPSSegmentLoadSkipped(ctx, info, segmentType.String(), "already_loaded_or_loading")
+		}
+	}
+
 	log = log.With(
 		zap.Int64s("requestSegments", lo.Map(segments, func(s *querypb.SegmentLoadInfo, _ int) int64 { return s.GetSegmentID() })),
 		zap.Int64s("preparedSegments", lo.Map(infos, func(s *querypb.SegmentLoadInfo, _ int) int64 { return s.GetSegmentID() })),
@@ -226,9 +233,15 @@ func (loader *segmentLoaderV2) Load(ctx context.Context,
 
 		metrics.QueryNodeLoadSegmentConcurrency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), "LoadSegment").Inc()
 		defer metrics.QueryNodeLoadSegmentConcurrency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), "LoadSegment").Dec()
+		loadStart := time.Now()
 		tr := timerecord.NewTimeRecorder("loadDurationPerSegment")
 
 		var err error
+		defer func() {
+			RecordQPSSegmentLoadEvent(ctx, "load_segment", loadInfo, segmentType.String(), time.Since(loadStart), err,
+				zap.Int64("version", version),
+			)
+		}()
 		if loadInfo.GetLevel() == datapb.SegmentLevel_L0 {
 			err = loader.LoadDelta(ctx, collectionID, segment.(*LocalSegment))
 		} else {
@@ -344,6 +357,7 @@ func (loader *segmentLoaderV2) loadBloomFilter(ctx context.Context, segmentID in
 	)
 
 	startTs := time.Now()
+	loadStart := time.Now()
 
 	url, err := typeutil_internal.GetStorageURI(paramtable.Get().CommonCfg.StorageScheme.GetValue(), paramtable.Get().CommonCfg.StoragePathPrefix.GetValue(), segmentID)
 	if err != nil {
@@ -356,13 +370,34 @@ func (loader *segmentLoaderV2) loadBloomFilter(ctx context.Context, segmentID in
 
 	statsBlobs := space.StatisticsBlobs()
 	blobs := []*storage.Blob{}
+	summary := QPSPathSummary{
+		StorageV2:  storeVersion > 0,
+		StorageVer: storeVersion,
+		Stats: QPSBinlogSummary{
+			fileCount: len(statsBlobs),
+		},
+	}
+	if len(statsBlobs) == 0 {
+		RecordQPSNoPathEvent(ctx, "load_bloom_filter_skipped", time.Since(loadStart), nil,
+			zap.Int64("segmentID", segmentID),
+			zap.Int64("storage_version", storeVersion),
+			zap.String("skip_reason", "empty_stats_blobs"),
+		)
+		return nil
+	}
 
 	for _, statsBlob := range statsBlobs {
 		blob := make([]byte, statsBlob.Size)
 		_, err := space.ReadBlob(statsBlob.Name, blob)
 		if err != nil && err != io.EOF {
+			RecordQPSPathEvent(ctx, "load_bloom_filter", summary, time.Since(loadStart), err,
+				zap.Int64("segmentID", segmentID),
+				zap.Int64("storage_version", storeVersion),
+			)
 			return err
 		}
+		summary.Stats.logBytes += int64(len(blob))
+		summary.Stats.memBytes += int64(len(blob))
 
 		blobs = append(blobs, &storage.Blob{Value: blob})
 	}
@@ -372,6 +407,10 @@ func (loader *segmentLoaderV2) loadBloomFilter(ctx context.Context, segmentID in
 	stats, err = storage.DeserializeStats(blobs)
 	if err != nil {
 		log.Warn("failed to deserialize stats", zap.Error(err))
+		RecordQPSPathEvent(ctx, "load_bloom_filter", summary, time.Since(loadStart), err,
+			zap.Int64("segmentID", segmentID),
+			zap.Int64("storage_version", storeVersion),
+		)
 		return err
 	}
 
@@ -386,6 +425,12 @@ func (loader *segmentLoaderV2) loadBloomFilter(ctx context.Context, segmentID in
 		bfs.AddHistoricalStats(pkStat)
 	}
 	log.Info("Successfully load pk stats", zap.Duration("time", time.Since(startTs)), zap.Uint("size", size), zap.Int("BFNum", len(stats)))
+	RecordQPSPathEvent(ctx, "load_bloom_filter", summary, time.Since(loadStart), nil,
+		zap.Int64("segmentID", segmentID),
+		zap.Int64("storage_version", storeVersion),
+		zap.Uint("bloom_filter_bytes", size),
+		zap.Int("bloom_filter_num", len(stats)),
+	)
 	return nil
 }
 
@@ -615,6 +660,13 @@ func (loader *segmentLoader) Load(ctx context.Context,
 	infos := loader.prepare(ctx, segmentType, segments...)
 	defer loader.unregister(infos...)
 
+	preparedIDs := typeutil.NewSet(lo.Map(infos, func(s *querypb.SegmentLoadInfo, _ int) int64 { return s.GetSegmentID() })...)
+	for _, info := range segments {
+		if !preparedIDs.Contain(info.GetSegmentID()) {
+			RecordQPSSegmentLoadSkipped(ctx, info, segmentType.String(), "already_loaded_or_loading")
+		}
+	}
+
 	log = log.With(
 		zap.Int64s("requestSegments", lo.Map(segments, func(s *querypb.SegmentLoadInfo, _ int) int64 { return s.GetSegmentID() })),
 		zap.Int64s("preparedSegments", lo.Map(infos, func(s *querypb.SegmentLoadInfo, _ int) int64 { return s.GetSegmentID() })),
@@ -689,8 +741,12 @@ func (loader *segmentLoader) Load(ctx context.Context,
 			zap.Int64("segmentID", segmentID),
 			zap.String("segmentType", loadInfo.GetLevel().String()))
 		metrics.QueryNodeLoadSegmentConcurrency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), "LoadSegment").Inc()
+		loadStart := time.Now()
 		defer func() {
 			metrics.QueryNodeLoadSegmentConcurrency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), "LoadSegment").Dec()
+			RecordQPSSegmentLoadEvent(ctx, "load_segment", loadInfo, segmentType.String(), time.Since(loadStart), err,
+				zap.Int64("version", version),
+			)
 			if err != nil {
 				logger.Warn("load segment failed when load data into memory", zap.Error(err))
 			}
@@ -1305,16 +1361,33 @@ func (loader *segmentLoader) loadBloomFilter(ctx context.Context, segmentID int6
 	)
 	if len(binlogPaths) == 0 {
 		log.Info("there are no stats logs saved with segment")
+		RecordQPSNoPathEvent(ctx, "load_bloom_filter_skipped", 0, nil,
+			zap.Int64("segmentID", segmentID),
+			zap.String("skip_reason", "empty_stats_logs"),
+		)
 		return nil
 	}
 
 	startTs := time.Now()
+	loadStart := time.Now()
+	summary := QPSPathSummary{
+		Stats: QPSBinlogSummary{
+			fileCount: len(binlogPaths),
+		},
+	}
 	values, err := loader.cm.MultiRead(ctx, binlogPaths)
 	if err != nil {
+		RecordQPSPathEvent(ctx, "load_bloom_filter", summary, time.Since(loadStart), err,
+			zap.Int64("segmentID", segmentID),
+			zap.Int("stats_log_path_count", len(binlogPaths)),
+			zap.Int64("stats_log_type", int64(logType)),
+		)
 		return err
 	}
 	blobs := []*storage.Blob{}
 	for i := 0; i < len(values); i++ {
+		summary.Stats.logBytes += int64(len(values[i]))
+		summary.Stats.memBytes += int64(len(values[i]))
 		blobs = append(blobs, &storage.Blob{Value: values[i]})
 	}
 
@@ -1323,12 +1396,22 @@ func (loader *segmentLoader) loadBloomFilter(ctx context.Context, segmentID int6
 		stats, err = storage.DeserializeStatsList(blobs[0])
 		if err != nil {
 			log.Warn("failed to deserialize stats list", zap.Error(err))
+			RecordQPSPathEvent(ctx, "load_bloom_filter", summary, time.Since(loadStart), err,
+				zap.Int64("segmentID", segmentID),
+				zap.Int("stats_log_path_count", len(binlogPaths)),
+				zap.Int64("stats_log_type", int64(logType)),
+			)
 			return err
 		}
 	} else {
 		stats, err = storage.DeserializeStats(blobs)
 		if err != nil {
 			log.Warn("failed to deserialize stats", zap.Error(err))
+			RecordQPSPathEvent(ctx, "load_bloom_filter", summary, time.Since(loadStart), err,
+				zap.Int64("segmentID", segmentID),
+				zap.Int("stats_log_path_count", len(binlogPaths)),
+				zap.Int64("stats_log_type", int64(logType)),
+			)
 			return err
 		}
 	}
@@ -1344,6 +1427,13 @@ func (loader *segmentLoader) loadBloomFilter(ctx context.Context, segmentID int6
 		bfs.AddHistoricalStats(pkStat)
 	}
 	log.Info("Successfully load pk stats", zap.Duration("time", time.Since(startTs)), zap.Uint("size", size))
+	RecordQPSPathEvent(ctx, "load_bloom_filter", summary, time.Since(loadStart), nil,
+		zap.Int64("segmentID", segmentID),
+		zap.Int("stats_log_path_count", len(binlogPaths)),
+		zap.Int64("stats_log_type", int64(logType)),
+		zap.Uint("bloom_filter_bytes", size),
+		zap.Int("bloom_filter_num", len(stats)),
+	)
 	return nil
 }
 
@@ -1359,6 +1449,8 @@ func (loader *segmentLoader) LoadDeltaLogs(ctx context.Context, segment Segment,
 	dCodec := storage.DeleteCodec{}
 	var blobs []*storage.Blob
 	var futures []*conc.Future[any]
+	loadStart := time.Now()
+	summary := QPSPathSummary{}
 	for _, deltaLog := range deltaLogs {
 		for _, bLog := range deltaLog.GetBinlogs() {
 			bLog := bLog
@@ -1367,6 +1459,10 @@ func (loader *segmentLoader) LoadDeltaLogs(ctx context.Context, segment Segment,
 				bLog.GetTimestampTo() < segment.LastDeltaTimestamp() {
 				continue
 			}
+			summary.Delta.fileCount++
+			summary.Delta.logBytes += bLog.GetLogSize()
+			summary.Delta.memBytes += bLog.GetMemorySize()
+			summary.Delta.entryCount += bLog.GetEntriesNum()
 			future := GetLoadPool().Submit(func() (any, error) {
 				value, err := loader.cm.Read(ctx, bLog.GetLogPath())
 				if err != nil {
@@ -1384,25 +1480,52 @@ func (loader *segmentLoader) LoadDeltaLogs(ctx context.Context, segment Segment,
 	for _, future := range futures {
 		blob, err := future.Await()
 		if err != nil {
+			RecordQPSPathEvent(ctx, "load_delta_logs", summary, time.Since(loadStart), err,
+				zap.Int64("segmentID", segment.ID()),
+				zap.String("segmentType", segment.Type().String()),
+				zap.Int("delta_blob_count", len(blobs)),
+			)
 			return err
 		}
 		blobs = append(blobs, blob.(*storage.Blob))
 	}
 	if len(blobs) == 0 {
 		log.Info("there are no delta logs saved with segment, skip loading delete record")
+		RecordQPSNoPathEvent(ctx, "load_delta_logs_skipped", time.Since(loadStart), nil,
+			zap.Int64("segmentID", segment.ID()),
+			zap.String("segmentType", segment.Type().String()),
+			zap.String("skip_reason", "empty_or_already_applied_delta_logs"),
+		)
 		return nil
 	}
 	_, _, deltaData, err := dCodec.Deserialize(blobs)
 	if err != nil {
+		RecordQPSPathEvent(ctx, "load_delta_logs", summary, time.Since(loadStart), err,
+			zap.Int64("segmentID", segment.ID()),
+			zap.String("segmentType", segment.Type().String()),
+			zap.Int("delta_blob_count", len(blobs)),
+		)
 		return err
 	}
 
 	err = segment.LoadDeltaData(ctx, deltaData)
 	if err != nil {
+		RecordQPSPathEvent(ctx, "load_delta_logs", summary, time.Since(loadStart), err,
+			zap.Int64("segmentID", segment.ID()),
+			zap.String("segmentType", segment.Type().String()),
+			zap.Int("delta_blob_count", len(blobs)),
+			zap.Int64("delete_count", deltaData.RowCount),
+		)
 		return err
 	}
 
 	log.Info("load delta logs done", zap.Int64("deleteCount", deltaData.RowCount))
+	RecordQPSPathEvent(ctx, "load_delta_logs", summary, time.Since(loadStart), nil,
+		zap.Int64("segmentID", segment.ID()),
+		zap.String("segmentType", segment.Type().String()),
+		zap.Int("delta_blob_count", len(blobs)),
+		zap.Int64("delete_count", deltaData.RowCount),
+	)
 	return nil
 }
 

@@ -16,6 +16,8 @@
 
 #include "storage/MinioChunkManager.h"
 
+#include <chrono>
+#include <exception>
 #include <fstream>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
@@ -392,14 +394,63 @@ MinioChunkManager::ListWithPrefix(const std::string& filepath) {
 
 uint64_t
 MinioChunkManager::Read(const std::string& filepath, void* buf, uint64_t size) {
-    return GetObjectBuffer(default_bucket_name_, filepath, buf, size);
+    auto start = std::chrono::system_clock::now();
+    try {
+        auto read_size = GetObjectBuffer(default_bucket_name_, filepath, buf, size);
+        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now() - start)
+                              .count();
+        LOG_INFO(
+            "milvus_qps_path_object_io op=remote_read_cpp path_kind=object_storage_io object_storage_path_hit=true bucket={} path={} bytes={} latency_ms={} status=success",
+            default_bucket_name_,
+            filepath,
+            read_size,
+            latency_ms);
+        return read_size;
+    } catch (std::exception& e) {
+        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now() - start)
+                              .count();
+        LOG_WARN(
+            "milvus_qps_path_object_io op=remote_read_cpp path_kind=object_storage_io object_storage_path_hit=true bucket={} path={} bytes={} latency_ms={} status=fail error={}",
+            default_bucket_name_,
+            filepath,
+            size,
+            latency_ms,
+            e.what());
+        throw;
+    }
 }
 
 void
 MinioChunkManager::Write(const std::string& filepath,
                          void* buf,
                          uint64_t size) {
-    PutObjectBuffer(default_bucket_name_, filepath, buf, size);
+    auto start = std::chrono::system_clock::now();
+    try {
+        PutObjectBuffer(default_bucket_name_, filepath, buf, size);
+        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now() - start)
+                              .count();
+        LOG_INFO(
+            "milvus_qps_path_object_io op=remote_write_cpp path_kind=object_storage_io object_storage_path_hit=true bucket={} path={} bytes={} latency_ms={} status=success",
+            default_bucket_name_,
+            filepath,
+            size,
+            latency_ms);
+    } catch (std::exception& e) {
+        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now() - start)
+                              .count();
+        LOG_WARN(
+            "milvus_qps_path_object_io op=remote_write_cpp path_kind=object_storage_io object_storage_path_hit=true bucket={} path={} bytes={} latency_ms={} status=fail error={}",
+            default_bucket_name_,
+            filepath,
+            size,
+            latency_ms,
+            e.what());
+        throw;
+    }
 }
 
 bool

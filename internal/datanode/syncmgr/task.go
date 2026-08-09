@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
@@ -343,14 +344,75 @@ func (t *SyncTask) appendDeltalog(deltalog *datapb.Binlog) {
 
 // writeLogs writes log files (binlog/deltalog/statslog) into storage via chunkManger.
 func (t *SyncTask) writeLogs() error {
-	return retry.Do(context.Background(), func() error {
+	start := time.Now()
+	err := retry.Do(context.Background(), func() error {
 		return t.chunkManager.MultiWrite(context.Background(), t.segmentData)
 	}, t.writeRetryOpts...)
+	t.recordQPSDataNodeWrite(time.Since(start), err)
+	return err
 }
 
 // writeMeta updates segments via meta writer in option.
 func (t *SyncTask) writeMeta() error {
 	return t.metaWriter.UpdateSync(t)
+}
+
+func (t *SyncTask) recordQPSDataNodeWrite(latency time.Duration, err error) {
+	status := metrics.SuccessLabel
+	if err != nil {
+		status = metrics.FailLabel
+	}
+	var remoteBytes int64
+	for _, value := range t.segmentData {
+		remoteBytes += int64(len(value))
+	}
+	countFieldBinlogs := func(fieldBinlogs map[int64]*datapb.FieldBinlog) (int, int64) {
+		var count int
+		var bytes int64
+		for _, fieldBinlog := range fieldBinlogs {
+			for _, binlog := range fieldBinlog.GetBinlogs() {
+				count++
+				bytes += binlog.GetLogSize()
+			}
+		}
+		return count, bytes
+	}
+	insertCount, insertBytes := countFieldBinlogs(t.insertBinlogs)
+	statsCount, statsBytes := countFieldBinlogs(t.statsBinlogs)
+	deltaCount := len(t.deltaBinlog.GetBinlogs())
+	var deltaBytes int64
+	for _, binlog := range t.deltaBinlog.GetBinlogs() {
+		deltaBytes += binlog.GetLogSize()
+	}
+
+	fields := []zap.Field{
+		zap.String("op", "datanode_write_logs"),
+		zap.Bool("path_hit", true),
+		zap.String("path_kind", "datanode_minio_querynode"),
+		zap.String("status", status),
+		zap.Int64("collectionID", t.collectionID),
+		zap.Int64("partitionID", t.partitionID),
+		zap.Int64("segmentID", t.segmentID),
+		zap.String("channel", t.channelName),
+		zap.String("segmentLevel", t.level.String()),
+		zap.Bool("flush", t.isFlush),
+		zap.Bool("drop", t.isDrop),
+		zap.Int64("row_count", t.batchSize),
+		zap.Int("remote_file_count", len(t.segmentData)),
+		zap.Int64("remote_bytes", remoteBytes),
+		zap.Int("insert_log_file_count", insertCount),
+		zap.Int64("insert_log_bytes", insertBytes),
+		zap.Int("stats_log_file_count", statsCount),
+		zap.Int64("stats_log_bytes", statsBytes),
+		zap.Int("delta_log_file_count", deltaCount),
+		zap.Int64("delta_log_bytes", deltaBytes),
+		zap.Duration("latency", latency),
+		zap.Int64("latency_ms", latency.Milliseconds()),
+	}
+	if err != nil {
+		fields = append(fields, zap.Error(err))
+	}
+	log.Ctx(context.Background()).Info("milvus_qps_path_trace", fields...)
 }
 
 func (t *SyncTask) SegmentID() int64 {

@@ -31,6 +31,7 @@ import (
 	"io"
 	"runtime"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/apache/arrow/go/v12/arrow/array"
@@ -875,7 +876,7 @@ func (s *LocalSegment) Delete(ctx context.Context, primaryKeys []storage.Primary
 }
 
 // -------------------------------------------------------------------------------------- interfaces for sealed segment
-func (s *LocalSegment) LoadMultiFieldData(ctx context.Context) error {
+func (s *LocalSegment) LoadMultiFieldData(ctx context.Context) (err error) {
 	loadInfo := s.loadInfo.Load()
 	rowCount := loadInfo.GetNumOfRows()
 	fields := loadInfo.GetBinlogPaths()
@@ -890,6 +891,21 @@ func (s *LocalSegment) LoadMultiFieldData(ctx context.Context) error {
 		zap.Int64("partitionID", s.Partition()),
 		zap.Int64("segmentID", s.ID()),
 	)
+
+	loadStart := time.Now()
+	defer func() {
+		RecordQPSPathEvent(ctx, "load_multi_field_data", QPSPathSummary{
+			Insert:     summarizeBinlogs(fields),
+			StorageV2:  loadInfo.GetStorageVersion() > 0,
+			StorageVer: loadInfo.GetStorageVersion(),
+		}, time.Since(loadStart), err,
+			zap.Int64("collectionID", s.Collection()),
+			zap.Int64("partitionID", s.Partition()),
+			zap.Int64("segmentID", s.ID()),
+			zap.Int64("row_count", rowCount),
+			zap.String("segmentType", s.Type().String()),
+		)
+	}()
 
 	loadFieldDataInfo, err := newLoadFieldDataInfo(ctx)
 	defer deleteFieldDataInfo(loadFieldDataInfo)
@@ -944,7 +960,7 @@ func (s *LocalSegment) LoadMultiFieldData(ctx context.Context) error {
 	return nil
 }
 
-func (s *LocalSegment) LoadFieldData(ctx context.Context, fieldID int64, rowCount int64, field *datapb.FieldBinlog, useMmap bool) error {
+func (s *LocalSegment) LoadFieldData(ctx context.Context, fieldID int64, rowCount int64, field *datapb.FieldBinlog, useMmap bool) (err error) {
 	if !s.ptrLock.RLockIf(state.IsNotReleased) {
 		return merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
 	}
@@ -961,6 +977,21 @@ func (s *LocalSegment) LoadFieldData(ctx context.Context, fieldID int64, rowCoun
 		zap.Int64("rowCount", rowCount),
 	)
 	log.Info("start loading field data for field")
+
+	loadInfo := s.LoadInfo()
+	loadStart := time.Now()
+	mmapEnabled := false
+	defer func() {
+		RecordQPSPathEvent(ctx, "load_field_data", SummarizeFieldBinlog(field, loadInfo.GetStorageVersion()), time.Since(loadStart), err,
+			zap.Int64("collectionID", s.Collection()),
+			zap.Int64("partitionID", s.Partition()),
+			zap.Int64("segmentID", s.ID()),
+			zap.Int64("fieldID", fieldID),
+			zap.Int64("row_count", rowCount),
+			zap.String("segmentType", s.Type().String()),
+			zap.Bool("mmap_enabled", mmapEnabled),
+		)
+	}()
 
 	loadFieldDataInfo, err := newLoadFieldDataInfo(ctx)
 	defer deleteFieldDataInfo(loadFieldDataInfo)
@@ -983,7 +1014,7 @@ func (s *LocalSegment) LoadFieldData(ctx context.Context, fieldID int64, rowCoun
 	}
 
 	collection := s.collection
-	mmapEnabled := useMmap || common.IsFieldMmapEnabled(collection.Schema(), fieldID) ||
+	mmapEnabled = useMmap || common.IsFieldMmapEnabled(collection.Schema(), fieldID) ||
 		(!common.FieldHasMmapKey(collection.Schema(), fieldID) && params.Params.QueryNodeCfg.MmapEnabled.GetAsBool())
 	loadFieldDataInfo.appendMMapDirPath(paramtable.Get().QueryNodeCfg.MmapDirPath.GetValue())
 	loadFieldDataInfo.enableMmap(fieldID, mmapEnabled)
@@ -1236,7 +1267,7 @@ func (s *LocalSegment) LoadDeltaData(ctx context.Context, deltaData *storage.Del
 	return nil
 }
 
-func (s *LocalSegment) LoadIndex(ctx context.Context, indexInfo *querypb.FieldIndexInfo, fieldType schemapb.DataType) error {
+func (s *LocalSegment) LoadIndex(ctx context.Context, indexInfo *querypb.FieldIndexInfo, fieldType schemapb.DataType) (err error) {
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", s.Collection()),
 		zap.Int64("partitionID", s.Partition()),
@@ -1249,11 +1280,33 @@ func (s *LocalSegment) LoadIndex(ctx context.Context, indexInfo *querypb.FieldIn
 	// the index loaded
 	if old != nil && old.IndexInfo.GetIndexID() == indexInfo.GetIndexID() && old.IsLoaded {
 		log.Warn("index already loaded")
+		RecordQPSNoPathEvent(ctx, "load_index_skipped", 0, nil,
+			zap.Int64("collectionID", s.Collection()),
+			zap.Int64("partitionID", s.Partition()),
+			zap.Int64("segmentID", s.ID()),
+			zap.Int64("fieldID", indexInfo.GetFieldID()),
+			zap.Int64("indexID", indexInfo.GetIndexID()),
+			zap.String("skip_reason", "already_loaded"),
+		)
 		return nil
 	}
 
 	ctx, sp := otel.Tracer(typeutil.QueryNodeRole).Start(ctx, fmt.Sprintf("LoadIndex-%d-%d", s.ID(), indexInfo.GetFieldID()))
 	defer sp.End()
+
+	loadStart := time.Now()
+	defer func() {
+		RecordQPSPathEvent(ctx, "load_index", SummarizeIndexInfo(indexInfo), time.Since(loadStart), err,
+			zap.Int64("collectionID", s.Collection()),
+			zap.Int64("partitionID", s.Partition()),
+			zap.Int64("segmentID", s.ID()),
+			zap.Int64("fieldID", indexInfo.GetFieldID()),
+			zap.Int64("indexID", indexInfo.GetIndexID()),
+			zap.Int64("buildID", indexInfo.GetBuildID()),
+			zap.String("fieldType", fieldType.String()),
+			zap.String("segmentType", s.Type().String()),
+		)
+	}()
 
 	tr := timerecord.NewTimeRecorder("loadIndex")
 	// 1.

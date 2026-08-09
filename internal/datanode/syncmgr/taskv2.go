@@ -18,6 +18,7 @@ package syncmgr
 
 import (
 	"context"
+	"time"
 
 	"github.com/apache/arrow/go/v12/arrow"
 	"github.com/apache/arrow/go/v12/arrow/array"
@@ -33,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/retry"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
@@ -107,6 +109,7 @@ func (t *SyncTaskV2) Run() error {
 }
 
 func (t *SyncTaskV2) writeSpace() error {
+	start := time.Now()
 	defer func() {
 		if t.reader != nil {
 			t.reader.Release()
@@ -127,7 +130,9 @@ func (t *SyncTaskV2) writeSpace() error {
 		txn.WriteBlob(t.statsBlob.Value, t.statsBlob.Key, false)
 	}
 
-	return txn.Commit()
+	err := txn.Commit()
+	t.recordQPSDataNodeWriteV2(time.Since(start), err)
+	return err
 }
 
 func (t *SyncTaskV2) writeMeta() error {
@@ -239,4 +244,40 @@ func (t *SyncTaskV2) WithArrowSchema(arrowSchema *arrow.Schema) *SyncTaskV2 {
 func (t *SyncTaskV2) WithLevel(level datapb.SegmentLevel) *SyncTaskV2 {
 	t.level = level
 	return t
+}
+
+func (t *SyncTaskV2) recordQPSDataNodeWriteV2(latency time.Duration, err error) {
+	status := metrics.SuccessLabel
+	if err != nil {
+		status = metrics.FailLabel
+	}
+	var statsBytes int64
+	if t.statsBlob != nil {
+		statsBytes = int64(len(t.statsBlob.Value))
+	}
+	fields := []zap.Field{
+		zap.String("op", "datanode_write_storage_v2"),
+		zap.Bool("path_hit", true),
+		zap.String("path_kind", "datanode_minio_querynode_storage_v2"),
+		zap.String("status", status),
+		zap.Int64("collectionID", t.collectionID),
+		zap.Int64("partitionID", t.partitionID),
+		zap.Int64("segmentID", t.segmentID),
+		zap.String("channel", t.channelName),
+		zap.String("segmentLevel", t.level.String()),
+		zap.Bool("flush", t.isFlush),
+		zap.Bool("drop", t.isDrop),
+		zap.Int64("row_count", t.batchSize),
+		zap.Bool("has_insert_reader", t.reader != nil),
+		zap.Bool("has_delete_reader", t.deleteReader != nil),
+		zap.Bool("has_stats_blob", t.statsBlob != nil),
+		zap.Int64("stats_log_bytes", statsBytes),
+		zap.Int64("storage_version", t.space.GetCurrentVersion()),
+		zap.Duration("latency", latency),
+		zap.Int64("latency_ms", latency.Milliseconds()),
+	}
+	if err != nil {
+		fields = append(fields, zap.Error(err))
+	}
+	log.Ctx(context.Background()).Info("milvus_qps_path_trace", fields...)
 }

@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <string>
 
@@ -162,8 +163,17 @@ uint64_t
 OpenDALChunkManager::Read(const std::string& filepath,
                           void* buf,
                           uint64_t size) {
+    auto start = std::chrono::system_clock::now();
     auto ret = opendal_operator_reader(op_ptr_, filepath.c_str());
     if (ret.error != nullptr) {
+        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now() - start)
+                              .count();
+        LOG_WARN(
+            "milvus_qps_path_object_io op=remote_read_cpp path_kind=object_storage_io object_storage_path_hit=true path={} bytes={} latency_ms={} status=fail error=open_reader_failed",
+            filepath,
+            size,
+            latency_ms);
         THROWOPENDALERROR(ret.error, "GetObjectBuffer");
     }
     auto reader = OpendalReader(ret.reader);
@@ -176,6 +186,16 @@ OpenDALChunkManager::Read(const std::string& filepath,
                                 buf_size);
         buf_index += read_ret.size;
         if (read_ret.error != nullptr) {
+            auto latency_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now() - start)
+                    .count();
+            LOG_WARN(
+                "milvus_qps_path_object_io op=remote_read_cpp path_kind=object_storage_io object_storage_path_hit=true path={} bytes={} actual_bytes={} latency_ms={} status=fail error=read_failed",
+                filepath,
+                size,
+                buf_index,
+                latency_ms);
             THROWOPENDALERROR(read_ret.error, "GetObjectBuffer");
         }
         if (read_ret.size == 0) {
@@ -183,6 +203,15 @@ OpenDALChunkManager::Read(const std::string& filepath,
         }
     }
     if (buf_index != size) {
+        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now() - start)
+                              .count();
+        LOG_WARN(
+            "milvus_qps_path_object_io op=remote_read_cpp path_kind=object_storage_io object_storage_path_hit=true path={} bytes={} actual_bytes={} latency_ms={} status=fail error=read_size_mismatch",
+            filepath,
+            size,
+            buf_index,
+            latency_ms);
         throw SegcoreError(
             S3Error,
             fmt::format(
@@ -190,6 +219,14 @@ OpenDALChunkManager::Read(const std::string& filepath,
                 size,
                 buf_index));
     }
+    auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now() - start)
+                          .count();
+    LOG_INFO(
+        "milvus_qps_path_object_io op=remote_read_cpp path_kind=object_storage_io object_storage_path_hit=true path={} bytes={} latency_ms={} status=success",
+        filepath,
+        buf_index,
+        latency_ms);
     return buf_index;
 }
 
