@@ -2,6 +2,7 @@ package datanode
 
 import (
 	"context"
+	"time"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/samber/lo"
@@ -14,6 +15,7 @@ import (
 	"github.com/milvus-io/milvus/internal/datanode/writebuffer"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/tracer"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
@@ -62,6 +64,26 @@ func (wNode *writeNode) Operate(in []Msg) []Msg {
 		ctx, sp := startTracer(msg, "WriteNode")
 		spans = append(spans, sp)
 		msg.SetTraceCtx(ctx)
+
+		// Trace: extract trace ID from message and record consume lag
+		if traceID := tracer.GetTraceIDFromContext(msg.TraceCtx()); traceID != "" {
+			// Calculate consume lag from message timestamp to now
+			msgTimestamp := msg.BeginTimestamp
+			consumeLag := time.Now().UnixNano() - int64(msgTimestamp)
+			tracer.GetGlobalTracer().RecordEvent(
+				traceID,
+				"",
+				"Insert",
+				"consume_lag",
+				"datanode",
+				time.Duration(consumeLag),
+				map[string]interface{}{
+					"channel":    wNode.channelName,
+					"segment_id": msg.GetSegmentID(),
+					"num_rows":   msg.NRows(),
+				},
+			)
+		}
 	}
 	defer func() {
 		for _, sp := range spans {
@@ -71,7 +93,25 @@ func (wNode *writeNode) Operate(in []Msg) []Msg {
 
 	start, end := fgMsg.startPositions[0], fgMsg.endPositions[0]
 
+	// Trace: buffer data processing
+	var processSpan *tracer.SpanContext
+	if len(fgMsg.insertMessages) > 0 {
+		if traceID := tracer.GetTraceIDFromContext(fgMsg.insertMessages[0].TraceCtx()); traceID != "" {
+			processSpan = tracer.GetGlobalTracer().StartSpan(
+				traceID, "", "Insert", "datanode_process", "datanode",
+				map[string]interface{}{
+					"channel":        wNode.channelName,
+					"num_inserts":    len(fgMsg.insertMessages),
+					"num_deletes":    len(fgMsg.deleteMessages),
+				},
+			)
+		}
+	}
+
 	err := wNode.wbManager.BufferData(wNode.channelName, fgMsg.insertMessages, fgMsg.deleteMessages, start, end)
+
+	tracer.EndTrace(processSpan)
+
 	if err != nil {
 		log.Error("failed to buffer data", zap.Error(err))
 		panic(err)

@@ -15,6 +15,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/tracer"
 	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/timerecord"
@@ -220,6 +221,11 @@ func (it *insertTask) Execute(ctx context.Context) error {
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Insert-Execute")
 	defer sp.End()
 
+	// Initialize trace ID for latency analysis
+	traceID := tracer.GenerateTraceID()
+	ctx = tracer.SetTraceIDToContext(ctx, traceID)
+	it.ctx = ctx // Update task context with trace ID
+
 	tr := timerecord.NewTimeRecorder(fmt.Sprintf("proxy execute insert %d", it.ID()))
 
 	collectionName := it.insertMsg.CollectionName
@@ -253,6 +259,13 @@ func (it *insertTask) Execute(ctx context.Context) error {
 		zap.Duration("get cache duration", getCacheDur),
 		zap.Duration("get msgStream duration", getMsgStreamDur))
 
+	// Trace: serialize and repack data
+	serializeSpan := tracer.TraceInsert(ctx, "serialize", map[string]interface{}{
+		"collection_id": collID,
+		"num_rows":      it.insertMsg.NRows(),
+	})
+	serializeSpan.SetComponent("proxy")
+
 	// assign segmentID for insert data and repack data by segmentID
 	var msgPack *msgstream.MsgPack
 	if it.partitionKeys == nil {
@@ -266,20 +279,32 @@ func (it *insertTask) Execute(ctx context.Context) error {
 		return err
 	}
 	assignSegmentIDDur := tr.RecordSpan()
+	tracer.EndTrace(serializeSpan)
 
 	log.Debug("assign segmentID for insert data success",
 		zap.Duration("assign segmentID duration", assignSegmentIDDur))
+
+	// Trace: produce to MQ
+	mqProduceSpan := tracer.TraceInsert(ctx, "mq_produce", map[string]interface{}{
+		"collection_id": collID,
+		"num_messages":  len(msgPack.Msgs),
+	})
+	mqProduceSpan.SetComponent("proxy")
+
 	err = stream.Produce(msgPack)
 	if err != nil {
 		log.Warn("fail to produce insert msg", zap.Error(err))
 		it.result.Status = merr.Status(err)
 		return err
 	}
+	tracer.EndTrace(mqProduceSpan)
+
 	sendMsgDur := tr.RecordSpan()
 	metrics.ProxySendMutationReqLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), metrics.InsertLabel).Observe(float64(sendMsgDur.Milliseconds()))
 	totalExecDur := tr.ElapseSpan()
 	log.Debug("Proxy Insert Execute done",
 		zap.String("collectionName", collectionName),
+		zap.String("trace_id", traceID),
 		zap.Duration("send message duration", sendMsgDur),
 		zap.Duration("execute duration", totalExecDur))
 

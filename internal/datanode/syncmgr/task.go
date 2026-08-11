@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
@@ -36,6 +37,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/tracer"
 	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/metautil"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
@@ -171,11 +173,32 @@ func (t *SyncTask) Run() (err error) {
 		return err
 	}
 
+	// Trace: serialize blobs
+	serializeStart := time.Now()
 	t.processInsertBlobs()
 	t.processStatsBlob()
 	t.processDeltaBlob()
+	serializeDur := time.Since(serializeStart)
+
+	// Trace: write to S3
+	s3WriteSpan := tracer.GetGlobalTracer().StartSpan(
+		"", // TODO: extract trace ID from task context if available
+		"",
+		"Flush",
+		"s3_write",
+		"datanode",
+		map[string]interface{}{
+			"segment_id":   t.segmentID,
+			"is_flush":     t.isFlush,
+			"level":        t.level.String(),
+			"serialize_ms": serializeDur.Milliseconds(),
+		},
+	)
 
 	err = t.writeLogs()
+
+	tracer.EndTrace(s3WriteSpan)
+
 	if err != nil {
 		log.Warn("failed to save serialized data into storage", zap.Error(err))
 		return err

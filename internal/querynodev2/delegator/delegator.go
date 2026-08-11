@@ -48,6 +48,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/tracer"
 	"github.com/milvus-io/milvus/pkg/util/conc"
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/util/lifetime"
@@ -251,6 +252,10 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 	}
 	defer sd.lifetime.Done()
 
+	// Initialize trace ID for search operation
+	traceID := tracer.GenerateTraceID()
+	ctx = tracer.SetTraceIDToContext(ctx, traceID)
+
 	if !funcutil.SliceContain(req.GetDmlChannels(), sd.vchannelName) {
 		log.Warn("deletgator received search request not belongs to it",
 			zap.Strings("reqChannels", req.GetDmlChannels()),
@@ -277,6 +282,13 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 		fmt.Sprint(paramtable.GetNodeID()), metrics.SearchLabel).
 		Observe(float64(waitTr.ElapseSpan().Milliseconds()))
 
+	// Trace: route and pin segments
+	routeSpan := tracer.TraceSearch(ctx, "route", map[string]interface{}{
+		"collection_id": req.GetReq().GetCollectionID(),
+		"partitions":    partitions,
+	})
+	routeSpan.SetComponent("querynode")
+
 	sealed, growing, version, err := sd.distribution.PinReadableSegments(req.GetReq().GetPartitionIDs()...)
 	if err != nil {
 		log.Warn("delegator failed to search, current distribution is not serviceable")
@@ -287,6 +299,18 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 	growing = lo.Filter(growing, func(segment SegmentEntry, _ int) bool {
 		return funcutil.SliceContain(existPartitions, segment.PartitionID)
 	})
+
+	// Record segment statistics
+	routeSpan.AddMetadata("sealed_count", len(sealed))
+	routeSpan.AddMetadata("growing_count", len(growing))
+	tracer.EndTrace(routeSpan)
+
+	// Record segment type counts
+	tracer.GetGlobalTracer().RecordEvent(traceID, "", "Search", "segment_stats", "querynode",
+		0, map[string]interface{}{
+			"sealed_segments":  len(sealed),
+			"growing_segments": len(growing),
+		})
 
 	if req.GetReq().GetIsAdvanced() {
 		futures := make([]*conc.Future[*internalpb.SearchResults], len(req.GetReq().GetSubReqs()))

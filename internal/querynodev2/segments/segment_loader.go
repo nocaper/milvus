@@ -53,6 +53,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/tracer"
 	"github.com/milvus-io/milvus/pkg/util/conc"
 	"github.com/milvus-io/milvus/pkg/util/contextutil"
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
@@ -393,6 +394,23 @@ func (loader *segmentLoaderV2) LoadSegment(ctx context.Context,
 	segment *LocalSegment,
 	loadInfo *querypb.SegmentLoadInfo,
 ) (err error) {
+	// Trace: start load segment span
+	loadSpan := tracer.GetGlobalTracer().StartSpan(
+		"", // trace ID from context if available
+		"",
+		"LoadSegment",
+		"total_load",
+		"querynode",
+		map[string]interface{}{
+			"segment_id":   segment.ID(),
+			"collection_id": segment.Collection(),
+			"partition_id":  segment.Partition(),
+			"num_rows":      loadInfo.GetNumOfRows(),
+			"segment_type":  segment.Type().String(),
+		},
+	)
+	defer tracer.EndTrace(loadSpan)
+
 	// TODO: we should create a transaction-like api to load segment for segment interface,
 	// but not do many things in segment loader.
 	stateLockGuard, err := segment.StartLoadData()
