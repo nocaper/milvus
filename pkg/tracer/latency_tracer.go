@@ -53,11 +53,11 @@ func InitGlobalTracer(enabled bool, outputPath string, logger *zap.Logger) error
 	return err
 }
 
-// GetGlobalTracer returns the global tracer instance
+// GetGlobalTracer returns the global tracer instance.
+// If not yet initialized, it returns a disabled no-op tracer so callers
+// never need to nil-check.
 func GetGlobalTracer() *LatencyTracer {
 	if globalTracer == nil {
-		// Return a disabled tracer if not initialized
-		// This ensures the code doesn't crash if tracer is not initialized
 		once.Do(func() {
 			globalTracer = &LatencyTracer{enabled: false}
 		})
