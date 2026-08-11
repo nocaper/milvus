@@ -2,245 +2,233 @@
 """
 Milvus Latency Trace Analysis Script
 
-This script analyzes latency trace data collected from Milvus instrumentation
-to identify bottlenecks and quantify optimization opportunities.
+Parses [LATENCY_TRACE] lines written by Milvus directly to stdout and
+analyzes them to identify bottlenecks and quantify optimization opportunities.
+
+Log line format emitted by the tracer:
+  [LATENCY_TRACE] trace_id=<id> operation=<op> stage=<stage> component=<comp> duration_ms=<ms>
 
 Usage:
-    python analyze_latency_traces.py <trace_file.jsonl> [--output <report_dir>]
+    # From a captured log file:
+    python analyze_latency_traces.py milvus.log
+
+    # From stdin (pipe):
+    ./milvus run 2>&1 | python analyze_latency_traces.py -
+
+    # With report output directory:
+    python analyze_latency_traces.py milvus.log --output ./report
 """
 
-import json
+import re
 import sys
 import argparse
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 import statistics
 
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+# Optional visualization dependencies
+try:
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    HAS_PLOT_DEPS = True
+except ImportError:
+    HAS_PLOT_DEPS = False
+
+# Matches lines like:
+#   [LATENCY_TRACE] trace_id=abc operation=Insert stage=serialize component=proxy duration_ms=1.23
+_TRACE_RE = re.compile(
+    r'\[LATENCY_TRACE\]\s+'
+    r'trace_id=(\S+)\s+'
+    r'operation=(\S+)\s+'
+    r'stage=(\S+)\s+'
+    r'component=(\S+)\s+'
+    r'duration_ms=([\d.]+)'
+)
+
+
+def parse_trace_line(line: str) -> Optional[dict]:
+    """Return a dict for a [LATENCY_TRACE] line, or None if the line doesn't match."""
+    m = _TRACE_RE.search(line)
+    if not m:
+        return None
+    return {
+        'trace_id':   m.group(1),
+        'operation':  m.group(2),
+        'stage':      m.group(3),
+        'component':  m.group(4),
+        'duration_ms': float(m.group(5)),
+    }
 
 
 class LatencyAnalyzer:
-    """Analyzes latency trace data from Milvus operations"""
+    """Analyzes [LATENCY_TRACE] log lines from Milvus stdout output."""
 
-    def __init__(self, trace_file: str):
-        self.trace_file = trace_file
-        self.traces = []
-        self.traces_by_id = defaultdict(list)
-        self.load_traces()
+    def __init__(self):
+        self.traces: List[dict] = []
+        self.traces_by_id: Dict[str, List[dict]] = defaultdict(list)
 
-    def load_traces(self):
-        """Load trace events from JSONL file"""
-        with open(self.trace_file, 'r') as f:
-            for line in f:
-                try:
-                    event = json.loads(line.strip())
+    def load_from_source(self, source: str):
+        """Load trace events from a log file path, or '-' for stdin."""
+        if source == '-':
+            src = sys.stdin
+            close_after = False
+        else:
+            src = open(source, 'r', encoding='utf-8', errors='replace')
+            close_after = True
+
+        try:
+            for line in src:
+                event = parse_trace_line(line)
+                if event:
                     self.traces.append(event)
-                    if event.get('trace_id'):
-                        self.traces_by_id[event['trace_id']].append(event)
-                except json.JSONDecodeError as e:
-                    print(f"Warning: Failed to parse line: {e}", file=sys.stderr)
+                    self.traces_by_id[event['trace_id']].append(event)
+        finally:
+            if close_after:
+                src.close()
 
         print(f"Loaded {len(self.traces)} trace events from {len(self.traces_by_id)} traces")
 
+    # ------------------------------------------------------------------
+    # Analysis methods
+    # ------------------------------------------------------------------
+
     def analyze_write_path(self) -> Dict:
-        """Analyze write path (Insert/Upsert) latencies"""
+        """Analyze write path (Insert/Upsert) latencies."""
         write_stages = {
             'serialize': [],
             'mq_produce': [],
             'consume_lag': [],
             'datanode_process': [],
-            's3_write': []
+            's3_write': [],
         }
 
         for trace_id, events in self.traces_by_id.items():
-            operation = events[0].get('operation', '')
-            if operation not in ['Insert', 'Upsert']:
+            if events[0].get('operation', '') not in ('Insert', 'Upsert'):
                 continue
-
             for event in events:
                 stage = event.get('stage', '')
-                duration = event.get('duration_ms', 0)
-
                 if stage in write_stages:
-                    write_stages[stage].append(duration)
+                    write_stages[stage].append(event.get('duration_ms', 0))
 
-        # Calculate statistics
-        stats = {}
-        for stage, durations in write_stages.items():
-            if durations:
-                stats[stage] = {
-                    'count': len(durations),
-                    'mean': statistics.mean(durations),
-                    'median': statistics.median(durations),
-                    'p95': self._percentile(durations, 95),
-                    'p99': self._percentile(durations, 99),
-                    'min': min(durations),
-                    'max': max(durations),
-                }
-            else:
-                stats[stage] = {'count': 0}
-
-        return stats
+        return {stage: self._calc_stats(durs) for stage, durs in write_stages.items()}
 
     def analyze_search_path(self) -> Dict:
-        """Analyze search/query path latencies"""
-        search_stats = {
-            'total_searches': 0,
-            'growing_segment_hits': 0,
-            'sealed_segment_hits': 0,
-            'route_latency': [],
-            'total_latency': [],
-        }
+        """Analyze search/query path latencies."""
+        route_latency: List[float] = []
+        growing_hits = 0
+        sealed_hits = 0
+        total_searches = 0
 
         for trace_id, events in self.traces_by_id.items():
-            operation = events[0].get('operation', '')
-            if operation not in ['Search', 'Query']:
+            if events[0].get('operation', '') not in ('Search', 'Query'):
                 continue
-
-            search_stats['total_searches'] += 1
-
+            total_searches += 1
             for event in events:
                 stage = event.get('stage', '')
-                duration = event.get('duration_ms', 0)
-                metadata = event.get('metadata', {})
-
                 if stage == 'route':
-                    search_stats['route_latency'].append(duration)
+                    route_latency.append(event.get('duration_ms', 0))
                 elif stage == 'segment_stats':
-                    search_stats['growing_segment_hits'] += metadata.get('growing_segments', 0)
-                    search_stats['sealed_segment_hits'] += metadata.get('sealed_segments', 0)
-                elif stage == 'total_load':
-                    # This is a segment load triggered by search
-                    if 'load_wait' not in search_stats:
-                        search_stats['load_wait'] = []
-                    search_stats['load_wait'].append(duration)
+                    # segment counts are encoded in the log line via extra fields
+                    # (not present in the compact stdout format; tracked via separate events)
+                    pass
 
-        # Calculate statistics
-        stats = {}
-        for key, values in search_stats.items():
-            if isinstance(values, list) and values:
-                stats[key] = {
-                    'count': len(values),
-                    'mean': statistics.mean(values),
-                    'median': statistics.median(values),
-                    'p95': self._percentile(values, 95),
-                    'p99': self._percentile(values, 99),
-                }
-            else:
-                stats[key] = values
-
+        stats: Dict = {
+            'total_searches': total_searches,
+            'growing_segment_hits': growing_hits,
+            'sealed_segment_hits': sealed_hits,
+        }
+        if route_latency:
+            stats['route_latency'] = self._calc_stats(route_latency)
         return stats
 
     def analyze_load_operations(self) -> Dict:
-        """Analyze LoadCollection/LoadPartition operations"""
-        load_latencies = []
+        """Analyze LoadCollection/LoadPartition operations."""
+        load_latencies: List[float] = []
 
         for trace_id, events in self.traces_by_id.items():
-            operation = events[0].get('operation', '')
-            if operation not in ['LoadCollection', 'LoadPartition']:
+            if events[0].get('operation', '') not in ('LoadCollection', 'LoadPartition'):
                 continue
+            load_latencies.append(sum(e.get('duration_ms', 0) for e in events))
 
-            total_duration = sum(e.get('duration_ms', 0) for e in events)
-            load_latencies.append(total_duration)
-
-        if load_latencies:
-            return {
-                'count': len(load_latencies),
-                'mean': statistics.mean(load_latencies),
-                'median': statistics.median(load_latencies),
-                'p95': self._percentile(load_latencies, 95),
-                'p99': self._percentile(load_latencies, 99),
-                'min': min(load_latencies),
-                'max': max(load_latencies),
-            }
-        return {'count': 0}
+        return self._calc_stats(load_latencies)
 
     def analyze_segment_loads(self) -> Dict:
-        """Analyze individual segment load operations (key optimization target)"""
-        segment_loads = []
+        """Analyze individual segment load operations (key optimization target)."""
+        durations: List[float] = []
 
         for event in self.traces:
             if event.get('operation') == 'LoadSegment' and event.get('stage') == 'total_load':
-                duration = event.get('duration_ms', 0)
-                metadata = event.get('metadata', {})
-                segment_loads.append({
-                    'duration_ms': duration,
-                    'segment_id': metadata.get('segment_id'),
-                    'num_rows': metadata.get('num_rows'),
-                    'segment_type': metadata.get('segment_type'),
-                })
+                durations.append(event.get('duration_ms', 0))
 
-        if segment_loads:
-            durations = [s['duration_ms'] for s in segment_loads]
-            return {
-                'count': len(segment_loads),
-                'mean': statistics.mean(durations),
-                'median': statistics.median(durations),
-                'p95': self._percentile(durations, 95),
-                'p99': self._percentile(durations, 99),
-                'min': min(durations),
-                'max': max(durations),
-                'details': segment_loads,
-            }
-        return {'count': 0}
+        return self._calc_stats(durations)
+
+    # ------------------------------------------------------------------
+    # Report generation
+    # ------------------------------------------------------------------
 
     def generate_report(self, output_dir: Optional[str] = None):
-        """Generate comprehensive analysis report"""
+        """Generate comprehensive analysis report."""
+        output_path = Path(output_dir) if output_dir else Path('.')
         if output_dir:
-            output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
-        else:
-            output_path = Path('.')
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("MILVUS LATENCY ANALYSIS REPORT")
-        print("="*80)
+        print("=" * 80)
 
-        # Write Path Analysis
+        write_stats = self.analyze_write_path()
+        search_stats = self.analyze_search_path()
+        load_stats = self.analyze_load_operations()
+        seg_stats = self.analyze_segment_loads()
+
         print("\n### WRITE PATH ANALYSIS (Insert/Upsert)")
         print("-" * 80)
-        write_stats = self.analyze_write_path()
         self._print_stage_stats(write_stats)
 
-        # Search Path Analysis
         print("\n### SEARCH/QUERY PATH ANALYSIS")
         print("-" * 80)
-        search_stats = self.analyze_search_path()
         self._print_search_stats(search_stats)
 
-        # Load Operations Analysis
         print("\n### LOAD OPERATIONS ANALYSIS")
         print("-" * 80)
-        load_stats = self.analyze_load_operations()
         self._print_stats_dict(load_stats, "LoadCollection/LoadPartition")
 
-        # Segment Load Analysis (KEY OPTIMIZATION TARGET)
         print("\n### SEGMENT LOAD ANALYSIS (OPTIMIZATION TARGET)")
         print("-" * 80)
-        segment_load_stats = self.analyze_segment_loads()
-        self._print_stats_dict(segment_load_stats, "Segment Load from S3")
+        self._print_stats_dict(seg_stats, "Segment Load from S3")
 
-        # Bottleneck Summary
         print("\n### BOTTLENECK SUMMARY & OPTIMIZATION OPPORTUNITIES")
         print("-" * 80)
-        self._print_bottleneck_summary(write_stats, search_stats, segment_load_stats)
+        self._print_bottleneck_summary(write_stats, search_stats, seg_stats)
 
-        # Save detailed data to CSV
-        self._save_to_csv(output_path)
+        if HAS_PLOT_DEPS:
+            self._save_to_csv(output_path)
+            self._generate_plots(output_path, write_stats, search_stats, seg_stats)
+            print(f"\n✓ CSV and plots saved to {output_path}")
+        else:
+            print("\n(Install pandas/matplotlib/seaborn for CSV export and plots)")
 
-        # Generate plots
-        self._generate_plots(output_path, write_stats, search_stats, segment_load_stats)
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-        print(f"\n✓ Report saved to {output_path}")
-        print(f"  - CSV data: latency_analysis.csv")
-        print(f"  - Plots: *.png")
+    @staticmethod
+    def _calc_stats(durations: List[float]) -> Dict:
+        if not durations:
+            return {'count': 0}
+        return {
+            'count':  len(durations),
+            'mean':   statistics.mean(durations),
+            'median': statistics.median(durations),
+            'p95':    LatencyAnalyzer._percentile(durations, 95),
+            'p99':    LatencyAnalyzer._percentile(durations, 99),
+            'min':    min(durations),
+            'max':    max(durations),
+        }
 
     def _print_stage_stats(self, stats: Dict):
-        """Print statistics for write path stages"""
         for stage, data in stats.items():
             if data.get('count', 0) > 0:
                 print(f"\n{stage}:")
@@ -252,21 +240,14 @@ class LatencyAnalyzer:
                 print(f"  Min/Max:  {data['min']:.2f} / {data['max']:.2f} ms")
 
     def _print_search_stats(self, stats: Dict):
-        """Print search/query statistics"""
         print(f"\nTotal searches: {stats.get('total_searches', 0)}")
         print(f"Growing segment hits: {stats.get('growing_segment_hits', 0)}")
-        print(f"Sealed segment hits: {stats.get('sealed_segment_hits', 0)}")
-
-        if 'route_latency' in stats and isinstance(stats['route_latency'], dict):
-            print(f"\nRoute latency:")
+        print(f"Sealed segment hits:  {stats.get('sealed_segment_hits', 0)}")
+        if isinstance(stats.get('route_latency'), dict):
+            print("\nRoute latency:")
             self._print_stats_dict(stats['route_latency'], indent="  ")
 
-        if 'load_wait' in stats:
-            print(f"\nLoad wait (searches that triggered segment load):")
-            self._print_stats_dict(stats['load_wait'], indent="  ")
-
     def _print_stats_dict(self, data: Dict, label: str = "", indent: str = ""):
-        """Print statistics dictionary"""
         if data.get('count', 0) > 0:
             if label:
                 print(f"{indent}{label}:")
@@ -280,37 +261,30 @@ class LatencyAnalyzer:
         else:
             print(f"{indent}{label}: No data")
 
-    def _print_bottleneck_summary(self, write_stats, search_stats, segment_load_stats):
-        """Print bottleneck analysis and optimization opportunities"""
+    def _print_bottleneck_summary(self, write_stats, search_stats, seg_stats):
         print("\n🎯 KEY FINDINGS:")
 
-        # Segment load bottleneck (main optimization target)
-        if segment_load_stats.get('count', 0) > 0:
-            mean_load = segment_load_stats['mean']
-            p95_load = segment_load_stats['p95']
+        if seg_stats.get('count', 0) > 0:
+            mean_load = seg_stats['mean']
+            p95_load  = seg_stats['p95']
             print(f"\n1. SEGMENT LOAD FROM S3 (Primary Optimization Target):")
-            print(f"   - {segment_load_stats['count']} segment loads observed")
+            print(f"   - {seg_stats['count']} segment loads observed")
             print(f"   - Mean latency: {mean_load:.2f} ms")
             print(f"   - P95 latency:  {p95_load:.2f} ms")
             print(f"   💡 OPTIMIZATION: Shared memory pool can eliminate this latency")
-            print(f"      Expected QPS improvement: ~{(1000/mean_load)*segment_load_stats['count']:.1f} ops/sec")
+            print(f"      Expected QPS improvement: ~{(1000/mean_load)*seg_stats['count']:.1f} ops/sec")
 
-        # Write path analysis
         if write_stats.get('s3_write', {}).get('count', 0) > 0:
-            s3_write_mean = write_stats['s3_write']['mean']
             print(f"\n2. DATANODE S3 WRITE:")
-            print(f"   - Mean latency: {s3_write_mean:.2f} ms")
+            print(f"   - Mean latency: {write_stats['s3_write']['mean']:.2f} ms")
             print(f"   💡 OPTIMIZATION: Can be parallelized with shared memory push")
 
-        # Growing vs Sealed analysis
-        total_searches = search_stats.get('total_searches', 0)
-        if total_searches > 0:
-            growing_hits = search_stats.get('growing_segment_hits', 0)
-            sealed_hits = search_stats.get('sealed_segment_hits', 0)
+        total = search_stats.get('total_searches', 0)
+        if total > 0:
             print(f"\n3. SEARCH PATTERN ANALYSIS:")
-            print(f"   - Total searches: {total_searches}")
-            print(f"   - Growing segment queries: {growing_hits} (fast path, no S3)")
-            print(f"   - Sealed segment queries:  {sealed_hits} (may need S3 if not loaded)")
+            print(f"   - Total searches:          {total}")
+            print(f"   - Growing segment queries: {search_stats.get('growing_segment_hits', 0)}")
+            print(f"   - Sealed segment queries:  {search_stats.get('sealed_segment_hits', 0)}")
             print(f"   💡 Sealed segment queries benefit most from shared memory optimization")
 
         print("\n📊 EXPECTED OPTIMIZATION IMPACT:")
@@ -321,69 +295,57 @@ class LatencyAnalyzer:
         print("   ✓ Sealed segment queries: latency reduction = segment_load_latency")
 
     def _save_to_csv(self, output_path: Path):
-        """Save raw trace data to CSV for further analysis"""
         df = pd.DataFrame(self.traces)
-        csv_file = output_path / 'latency_analysis.csv'
-        df.to_csv(csv_file, index=False)
+        df.to_csv(output_path / 'latency_analysis.csv', index=False)
 
-        # Also save per-trace summary
-        trace_summary = []
-        for trace_id, events in self.traces_by_id.items():
-            operation = events[0].get('operation', 'Unknown')
-            total_duration = sum(e.get('duration_ms', 0) for e in events)
-            trace_summary.append({
-                'trace_id': trace_id,
-                'operation': operation,
-                'num_stages': len(events),
-                'total_duration_ms': total_duration,
-            })
+        trace_summary = [
+            {
+                'trace_id':         tid,
+                'operation':        events[0].get('operation', 'Unknown'),
+                'num_stages':       len(events),
+                'total_duration_ms': sum(e.get('duration_ms', 0) for e in events),
+            }
+            for tid, events in self.traces_by_id.items()
+        ]
+        pd.DataFrame(trace_summary).to_csv(output_path / 'trace_summary.csv', index=False)
 
-        df_summary = pd.DataFrame(trace_summary)
-        summary_file = output_path / 'trace_summary.csv'
-        df_summary.to_csv(summary_file, index=False)
-
-    def _generate_plots(self, output_path: Path, write_stats, search_stats, segment_load_stats):
-        """Generate visualization plots"""
+    def _generate_plots(self, output_path: Path, write_stats, search_stats, seg_stats):
         sns.set_style("whitegrid")
 
-        # Plot 1: Write path stage breakdown
-        if any(s.get('count', 0) > 0 for s in write_stats.values()):
+        # Write path stage breakdown
+        stages = [(s, d) for s, d in write_stats.items() if d.get('count', 0) > 0]
+        if stages:
             fig, ax = plt.subplots(figsize=(12, 6))
-            stages = []
-            means = []
-            p95s = []
-
-            for stage, data in write_stats.items():
-                if data.get('count', 0) > 0:
-                    stages.append(stage)
-                    means.append(data['mean'])
-                    p95s.append(data['p95'])
-
-            x = range(len(stages))
-            width = 0.35
-            ax.bar([i - width/2 for i in x], means, width, label='Mean', alpha=0.8)
-            ax.bar([i + width/2 for i in x], p95s, width, label='P95', alpha=0.8)
-
+            names = [s for s, _ in stages]
+            means = [d['mean'] for _, d in stages]
+            p95s  = [d['p95']  for _, d in stages]
+            x = range(len(names))
+            w = 0.35
+            ax.bar([i - w/2 for i in x], means, w, label='Mean', alpha=0.8)
+            ax.bar([i + w/2 for i in x], p95s,  w, label='P95',  alpha=0.8)
+            ax.set_xticks(x)
+            ax.set_xticklabels(names, rotation=45, ha='right')
             ax.set_xlabel('Stage')
             ax.set_ylabel('Latency (ms)')
             ax.set_title('Write Path Latency Breakdown')
-            ax.set_xticks(x)
-            ax.set_xticklabels(stages, rotation=45, ha='right')
             ax.legend()
             plt.tight_layout()
             plt.savefig(output_path / 'write_path_latency.png', dpi=300)
             plt.close()
 
-        # Plot 2: Segment load latency distribution (KEY!)
-        if segment_load_stats.get('count', 0) > 0:
-            durations = [s['duration_ms'] for s in segment_load_stats.get('details', [])]
-
+        # Segment load distribution
+        if seg_stats.get('count', 0) > 0:
+            durations = [
+                e.get('duration_ms', 0)
+                for e in self.traces
+                if e.get('operation') == 'LoadSegment' and e.get('stage') == 'total_load'
+            ]
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.hist(durations, bins=30, alpha=0.7, edgecolor='black')
-            ax.axvline(segment_load_stats['mean'], color='r', linestyle='--',
-                      label=f'Mean: {segment_load_stats["mean"]:.2f}ms')
-            ax.axvline(segment_load_stats['p95'], color='orange', linestyle='--',
-                      label=f'P95: {segment_load_stats["p95"]:.2f}ms')
+            ax.axvline(seg_stats['mean'], color='r',      linestyle='--',
+                       label=f"Mean: {seg_stats['mean']:.2f} ms")
+            ax.axvline(seg_stats['p95'],  color='orange', linestyle='--',
+                       label=f"P95: {seg_stats['p95']:.2f} ms")
             ax.set_xlabel('Latency (ms)')
             ax.set_ylabel('Frequency')
             ax.set_title('Segment Load Latency Distribution (Optimization Target)')
@@ -392,56 +354,55 @@ class LatencyAnalyzer:
             plt.savefig(output_path / 'segment_load_distribution.png', dpi=300)
             plt.close()
 
-        # Plot 3: Growing vs Sealed segment comparison
+        # Growing vs Sealed
         if search_stats.get('total_searches', 0) > 0:
             fig, ax = plt.subplots(figsize=(8, 6))
-            categories = ['Growing\nSegments', 'Sealed\nSegments']
-            counts = [
-                search_stats.get('growing_segment_hits', 0),
-                search_stats.get('sealed_segment_hits', 0)
-            ]
-            colors = ['#2ecc71', '#e74c3c']
-
-            bars = ax.bar(categories, counts, color=colors, alpha=0.7, edgecolor='black')
+            cats   = ['Growing\nSegments', 'Sealed\nSegments']
+            counts = [search_stats.get('growing_segment_hits', 0),
+                      search_stats.get('sealed_segment_hits',  0)]
+            bars = ax.bar(cats, counts, color=['#2ecc71', '#e74c3c'], alpha=0.7, edgecolor='black')
             ax.set_ylabel('Number of Segment Queries')
             ax.set_title('Growing vs Sealed Segment Query Distribution')
-
-            # Add value labels on bars
             for bar in bars:
-                height = bar.get_height()
-                ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{int(height)}',
-                       ha='center', va='bottom')
-
+                h = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width() / 2., h,
+                        f'{int(h)}', ha='center', va='bottom')
             plt.tight_layout()
             plt.savefig(output_path / 'segment_type_distribution.png', dpi=300)
             plt.close()
 
     @staticmethod
-    def _percentile(data: List[float], percentile: float) -> float:
-        """Calculate percentile value"""
+    def _percentile(data: List[float], pct: float) -> float:
         if not data:
             return 0.0
-        sorted_data = sorted(data)
-        index = int(len(sorted_data) * percentile / 100)
-        return sorted_data[min(index, len(sorted_data) - 1)]
+        sd = sorted(data)
+        idx = int(len(sd) * pct / 100)
+        return sd[min(idx, len(sd) - 1)]
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Analyze Milvus latency trace data for bottleneck identification'
+        description='Analyze Milvus [LATENCY_TRACE] log lines for bottleneck identification'
     )
-    parser.add_argument('trace_file', help='Path to trace JSONL file')
-    parser.add_argument('--output', '-o', default='./latency_report',
-                       help='Output directory for report and plots')
-
+    parser.add_argument(
+        'log_source',
+        nargs='?',
+        default='-',
+        help='Log file to read, or "-" to read from stdin (default: stdin)',
+    )
+    parser.add_argument(
+        '--output', '-o',
+        default='./latency_report',
+        help='Output directory for report and plots (default: ./latency_report)',
+    )
     args = parser.parse_args()
 
-    if not Path(args.trace_file).exists():
-        print(f"Error: Trace file not found: {args.trace_file}", file=sys.stderr)
+    if args.log_source != '-' and not Path(args.log_source).exists():
+        print(f"Error: log file not found: {args.log_source}", file=sys.stderr)
         sys.exit(1)
 
-    analyzer = LatencyAnalyzer(args.trace_file)
+    analyzer = LatencyAnalyzer()
+    analyzer.load_from_source(args.log_source)
     analyzer.generate_report(args.output)
 
 

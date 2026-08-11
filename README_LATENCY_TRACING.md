@@ -116,14 +116,11 @@ cd D:\project\claude\c_qps2.4.5\milvus
 make milvus
 ```
 
-### 2️⃣ 启动（启用 Tracing）
+### 2️⃣ 启动（Tracing 默认开启）
 
 ```bash
-export MILVUS_LATENCY_TRACE_ENABLED=true
-export MILVUS_LATENCY_TRACE_OUTPUT=/tmp/milvus_traces/latency_trace.jsonl
-mkdir -p /tmp/milvus_traces
-
-./bin/milvus run standalone
+# Tracing 已在代码中默认启用，直接启动并将日志重定向到文件
+./bin/milvus run standalone 2>&1 | tee /tmp/milvus.log
 ```
 
 ### 3️⃣ 运行 Benchmark
@@ -139,9 +136,7 @@ python scripts/demo_latency_tracing.py
 ### 4️⃣ 分析结果
 
 ```bash
-python scripts/analyze_latency_traces.py \
-    /tmp/milvus_traces/latency_trace.jsonl \
-    --output ./latency_report
+python scripts/analyze_latency_traces.py /tmp/milvus.log --output ./latency_report
 ```
 
 ### 5️⃣ 查看报告
@@ -245,12 +240,10 @@ bash scripts/validate_changes.sh
 make milvus
 
 # 3. 运行 demo（可选）
-export MILVUS_LATENCY_TRACE_ENABLED=true
-export MILVUS_LATENCY_TRACE_OUTPUT=/tmp/test_trace.jsonl
-./bin/milvus run standalone &
+./bin/milvus run standalone 2>&1 | tee /tmp/test_milvus.log &
 sleep 10
 python scripts/demo_latency_tracing.py
-python scripts/analyze_latency_traces.py /tmp/test_trace.jsonl -o /tmp/report
+python scripts/analyze_latency_traces.py /tmp/test_milvus.log -o /tmp/report
 ```
 
 ---
@@ -274,11 +267,7 @@ python scripts/analyze_latency_traces.py /tmp/test_trace.jsonl -o /tmp/report
    - 当前可用性：可以分别统计各组件延迟，但无法端到端追踪单个请求
    - 解决方案：需要修改 msgstream（可以后续完善）
 
-2. **Tracer 依赖环境变量**
-   - 需要手动设置 `MILVUS_LATENCY_TRACE_ENABLED=true`
-   - 未集成到 Milvus 配置系统
-
-3. **打点粒度**
+2. **打点粒度**
    - `total_load` 是总延迟，未细分 S3 读取 vs 反序列化 vs 索引构建
    - 对于瓶颈分析已足够
 

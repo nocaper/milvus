@@ -19,54 +19,29 @@ make milvus
 make milvus-components
 ```
 
-## 二、启动 Milvus 并启用 Tracing
+## 二、启动 Milvus（Tracing 默认开启）
 
-### 方式 1：使用环境变量（推荐 - 裸机 Standalone）
+### 方式 1：直接启动并捕获日志（推荐 - 裸机 Standalone）
 
 ```bash
-# 启用 tracing
-export MILVUS_LATENCY_TRACE_ENABLED=true
-export MILVUS_LATENCY_TRACE_OUTPUT=/tmp/milvus_traces/latency_trace.jsonl
-
-# 创建输出目录
-mkdir -p /tmp/milvus_traces
-
-# 启动 Milvus standalone
-./bin/milvus run standalone
+# Tracing 已在代码中硬编码启用，无需设置环境变量
+# 将 stdout/stderr 重定向到文件，[LATENCY_TRACE] 行会自动写入
+./bin/milvus run standalone 2>&1 | tee /tmp/milvus.log
 ```
 
 ### 方式 2：使用启动脚本（推荐 - 自动化）
 
 ```bash
-# 使用提供的脚本（会自动设置环境变量、检查状态、等待启动）
+# 脚本会检查 Milvus 状态、启动并等待服务就绪
 chmod +x scripts/run_milvus_with_tracing.sh
 ./scripts/run_milvus_with_tracing.sh
 ```
 
 脚本会自动：
-- ✓ 设置环境变量
 - ✓ 检查是否已有 Milvus 运行
-- ✓ 启动 Milvus standalone
+- ✓ 启动 Milvus standalone（日志写到 `/tmp/milvus_standalone.log`）
 - ✓ 等待服务就绪
-- ✓ 显示日志位置和下一步操作
-
-### 方式 3：Docker Compose（仅当使用容器部署时）
-
-**注意**：本工具主要针对裸机 standalone 部署。如果你使用 Docker，需要在容器内设置环境变量。
-
-在 `docker-compose.yml` 中添加：
-
-```yaml
-services:
-  standalone:
-    environment:
-      - MILVUS_LATENCY_TRACE_ENABLED=true
-      - MILVUS_LATENCY_TRACE_OUTPUT=/tmp/latency_trace.jsonl
-    volumes:
-      - /tmp/milvus_traces:/tmp
-```
-
-**大多数情况推荐使用方式 1 或方式 2（裸机部署）。**
+- ✓ 显示分析命令和下一步操作
 
 ## 三、运行测试负载
 
@@ -112,9 +87,11 @@ pip install pandas matplotlib seaborn
 ### 2. 运行分析脚本
 
 ```bash
-python scripts/analyze_latency_traces.py \
-    /tmp/milvus_traces/latency_trace.jsonl \
-    --output ./latency_report
+# 从已捕获的日志文件分析
+python scripts/analyze_latency_traces.py /tmp/milvus.log --output ./latency_report
+
+# 或者从 stdin 实时分析
+tail -n +1 -f /tmp/milvus.log | python scripts/analyze_latency_traces.py -
 ```
 
 ### 3. 查看结果

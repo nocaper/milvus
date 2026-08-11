@@ -2,35 +2,31 @@ package tracer
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 // TraceEvent represents a single tracing event
 type TraceEvent struct {
-	TraceID   string    `json:"trace_id"`
-	RequestID string    `json:"request_id,omitempty"`
-	Operation string    `json:"operation"` // Insert, Upsert, Search, Query, LoadCollection, etc.
-	Stage     string    `json:"stage"`     // serialize, mq_produce, deserialize, s3_write, etc.
-	Component string    `json:"component"` // proxy, datanode, querynode, querycoord
-	StartTime time.Time `json:"start_time"`
-	EndTime   time.Time `json:"end_time"`
-	Duration  float64   `json:"duration_ms"`
-	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	TraceID   string
+	RequestID string
+	Operation string // Insert, Upsert, Search, Query, LoadCollection, etc.
+	Stage     string // serialize, mq_produce, deserialize, s3_write, etc.
+	Component string // proxy, datanode, querynode, querycoord
+	StartTime time.Time
+	EndTime   time.Time
+	Duration  float64 // milliseconds
+	Metadata  map[string]interface{}
 }
 
 // LatencyTracer manages distributed tracing for latency analysis
 type LatencyTracer struct {
-	enabled    bool
-	outputFile *os.File
-	logger     *zap.Logger
-	mu         sync.Mutex
+	enabled bool
+	mu      sync.Mutex
 }
 
 var (
@@ -38,28 +34,19 @@ var (
 	once         sync.Once
 )
 
-// InitGlobalTracer initializes the global tracer
-func InitGlobalTracer(enabled bool, outputPath string, logger *zap.Logger) error {
-	var err error
+// InitGlobalTracer initializes the global tracer.
+func InitGlobalTracer(enabled bool) {
 	once.Do(func() {
-		globalTracer = &LatencyTracer{
-			enabled: enabled,
-			logger:  logger,
-		}
-		if enabled && outputPath != "" {
-			globalTracer.outputFile, err = os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		}
+		globalTracer = &LatencyTracer{enabled: enabled}
 	})
-	return err
 }
 
 // GetGlobalTracer returns the global tracer instance.
-// If not yet initialized, it returns a disabled no-op tracer so callers
-// never need to nil-check.
+// Auto-initializes as enabled if InitGlobalTracer has not been called yet.
 func GetGlobalTracer() *LatencyTracer {
 	if globalTracer == nil {
 		once.Do(func() {
-			globalTracer = &LatencyTracer{enabled: false}
+			globalTracer = &LatencyTracer{enabled: true}
 		})
 	}
 	return globalTracer
@@ -110,7 +97,7 @@ func (t *LatencyTracer) StartSpan(traceID, requestID, operation, stage, componen
 	}
 }
 
-// EndSpan ends a tracing span and records the event
+// EndSpan ends a tracing span and writes the event to stdout
 func (t *LatencyTracer) EndSpan(span *SpanContext) {
 	if !t.enabled || span == nil {
 		return
@@ -156,40 +143,17 @@ func (t *LatencyTracer) RecordEvent(traceID, requestID, operation, stage, compon
 	t.recordEvent(event)
 }
 
+// recordEvent writes a trace event directly to stdout in a grep-friendly,
+// fixed-format line consistent with other Milvus log output.
+// Format: [LATENCY_TRACE] trace_id=<id> operation=<op> stage=<stage> component=<comp> duration_ms=<ms>
 func (t *LatencyTracer) recordEvent(event TraceEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Write to file as JSON
-	if t.outputFile != nil {
-		data, err := json.Marshal(event)
-		if err == nil {
-			t.outputFile.Write(data)
-			t.outputFile.Write([]byte("\n"))
-		}
-	}
-
-	// Also log for debugging
-	if t.logger != nil {
-		t.logger.Info("latency_trace",
-			zap.String("trace_id", event.TraceID),
-			zap.String("operation", event.Operation),
-			zap.String("stage", event.Stage),
-			zap.String("component", event.Component),
-			zap.Float64("duration_ms", event.Duration),
-		)
-	}
-}
-
-// Close closes the tracer and flushes data
-func (t *LatencyTracer) Close() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if t.outputFile != nil {
-		return t.outputFile.Close()
-	}
-	return nil
+	fmt.Fprintf(os.Stdout,
+		"[LATENCY_TRACE] trace_id=%s operation=%s stage=%s component=%s duration_ms=%.2f\n",
+		event.TraceID, event.Operation, event.Stage, event.Component, event.Duration,
+	)
 }
 
 // Helper functions for common operations
@@ -200,8 +164,7 @@ func TraceInsert(ctx context.Context, stage string, metadata map[string]interfac
 	if traceID == "" {
 		return nil
 	}
-	tracer := GetGlobalTracer()
-	return tracer.StartSpan(traceID, "", "Insert", stage, getCurrentComponent(), metadata)
+	return GetGlobalTracer().StartSpan(traceID, "", "Insert", stage, getCurrentComponent(), metadata)
 }
 
 // TraceSearch traces a search operation span
@@ -210,8 +173,7 @@ func TraceSearch(ctx context.Context, stage string, metadata map[string]interfac
 	if traceID == "" {
 		return nil
 	}
-	tracer := GetGlobalTracer()
-	return tracer.StartSpan(traceID, "", "Search", stage, getCurrentComponent(), metadata)
+	return GetGlobalTracer().StartSpan(traceID, "", "Search", stage, getCurrentComponent(), metadata)
 }
 
 // TraceQuery traces a query operation span
@@ -220,8 +182,7 @@ func TraceQuery(ctx context.Context, stage string, metadata map[string]interface
 	if traceID == "" {
 		return nil
 	}
-	tracer := GetGlobalTracer()
-	return tracer.StartSpan(traceID, "", "Query", stage, getCurrentComponent(), metadata)
+	return GetGlobalTracer().StartSpan(traceID, "", "Query", stage, getCurrentComponent(), metadata)
 }
 
 // TraceLoadCollection traces a load collection operation span
@@ -230,8 +191,7 @@ func TraceLoadCollection(ctx context.Context, stage string, metadata map[string]
 	if traceID == "" {
 		return nil
 	}
-	tracer := GetGlobalTracer()
-	return tracer.StartSpan(traceID, "", "LoadCollection", stage, getCurrentComponent(), metadata)
+	return GetGlobalTracer().StartSpan(traceID, "", "LoadCollection", stage, getCurrentComponent(), metadata)
 }
 
 // EndTrace is a convenience function to end a span
@@ -241,11 +201,8 @@ func EndTrace(span *SpanContext) {
 	}
 }
 
-// getCurrentComponent tries to detect current component from environment or module
+// getCurrentComponent is a placeholder; component is set explicitly via SetComponent
 func getCurrentComponent() string {
-	// This is a placeholder - in real implementation, you'd detect this from
-	// environment variables or module initialization
-	// For now, we'll detect based on package usage context
 	return "unknown"
 }
 
@@ -266,8 +223,8 @@ func (s *SpanContext) AddMetadata(key string, value interface{}) {
 	}
 }
 
-// FormatTraceLog formats a trace event for logging
+// FormatTraceLog formats a trace line for logging (convenience helper)
 func FormatTraceLog(traceID, operation, stage string, durationMs float64) string {
-	return fmt.Sprintf("[TRACE] trace_id=%s operation=%s stage=%s duration_ms=%.2f",
+	return fmt.Sprintf("[LATENCY_TRACE] trace_id=%s operation=%s stage=%s duration_ms=%.2f",
 		traceID, operation, stage, durationMs)
 }
