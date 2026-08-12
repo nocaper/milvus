@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // TraceEvent represents a single tracing event
@@ -59,8 +60,15 @@ func GenerateTraceID() string {
 
 // GetTraceIDFromContext retrieves trace ID from context
 func GetTraceIDFromContext(ctx context.Context) string {
-	if traceID, ok := ctx.Value("traceID").(string); ok {
+	if ctx == nil {
+		return ""
+	}
+	if traceID, ok := ctx.Value("traceID").(string); ok && traceID != "" {
 		return traceID
+	}
+	otelTraceID := oteltrace.SpanContextFromContext(ctx).TraceID()
+	if otelTraceID.IsValid() {
+		return otelTraceID.String()
 	}
 	return ""
 }
@@ -85,6 +93,9 @@ type SpanContext struct {
 func (t *LatencyTracer) StartSpan(traceID, requestID, operation, stage, component string, metadata map[string]interface{}) *SpanContext {
 	if !t.enabled {
 		return nil
+	}
+	if traceID == "" {
+		traceID = GenerateTraceID()
 	}
 	return &SpanContext{
 		TraceID:   traceID,
@@ -125,6 +136,9 @@ func (t *LatencyTracer) EndSpan(span *SpanContext) {
 func (t *LatencyTracer) RecordEvent(traceID, requestID, operation, stage, component string, duration time.Duration, metadata map[string]interface{}) {
 	if !t.enabled {
 		return
+	}
+	if traceID == "" {
+		traceID = GenerateTraceID()
 	}
 
 	now := time.Now()

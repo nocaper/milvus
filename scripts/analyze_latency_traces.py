@@ -41,7 +41,7 @@ except ImportError:
 #   [LATENCY_TRACE] trace_id=abc operation=Search stage=segment_stats component=querynode duration_ms=0.00 sealed_segments=5 growing_segments=2
 _TRACE_RE = re.compile(
     r'\[LATENCY_TRACE\]\s+'
-    r'trace_id=(\S+)\s+'
+    r'trace_id=(\S*)\s+'
     r'operation=(\S+)\s+'
     r'stage=(\S+)\s+'
     r'component=(\S+)\s+'
@@ -67,11 +67,12 @@ def parse_trace_line(line: str) -> Optional[dict]:
     # Parse metadata fields from remaining text (group 6)
     metadata_text = m.group(6).strip()
     if metadata_text:
-        # Match key=value pairs in the metadata section
-        metadata_re = re.compile(r'(\w+)=([\d.]+)')
+        # Match key=value pairs in the metadata section. Values may be numeric
+        # or strings such as channel names and segment levels.
+        metadata_re = re.compile(r'(\w+)=("[^"]*"|\S+)')
         for match in metadata_re.finditer(metadata_text):
             key = match.group(1)
-            value = match.group(2)
+            value = match.group(2).strip('"')
             # Try to parse as int first, then float
             try:
                 result[key] = int(value)
@@ -90,6 +91,8 @@ class LatencyAnalyzer:
     def __init__(self):
         self.traces: List[dict] = []
         self.traces_by_id: Dict[str, List[dict]] = defaultdict(list)
+        self.trace_lines_seen = 0
+        self.unparsed_trace_lines = 0
 
     def load_from_source(self, source: str):
         """Load trace events from a log file path, or '-' for stdin."""
@@ -102,15 +105,27 @@ class LatencyAnalyzer:
 
         try:
             for line in src:
+                if '[LATENCY_TRACE]' in line:
+                    self.trace_lines_seen += 1
                 event = parse_trace_line(line)
                 if event:
+                    if not event.get('trace_id'):
+                        event['trace_id'] = f"missing-trace-{len(self.traces)}"
                     self.traces.append(event)
                     self.traces_by_id[event['trace_id']].append(event)
+                elif '[LATENCY_TRACE]' in line:
+                    self.unparsed_trace_lines += 1
         finally:
             if close_after:
                 src.close()
 
         print(f"Loaded {len(self.traces)} trace events from {len(self.traces_by_id)} traces")
+        if self.unparsed_trace_lines:
+            print(
+                f"Warning: skipped {self.unparsed_trace_lines} malformed [LATENCY_TRACE] lines "
+                f"out of {self.trace_lines_seen}",
+                file=sys.stderr,
+            )
 
     # ------------------------------------------------------------------
     # Analysis methods
@@ -126,13 +141,15 @@ class LatencyAnalyzer:
             's3_write': [],
         }
 
-        for trace_id, events in self.traces_by_id.items():
-            if events[0].get('operation', '') not in ('Insert', 'Upsert'):
-                continue
-            for event in events:
-                stage = event.get('stage', '')
-                if stage in write_stages:
-                    write_stages[stage].append(event.get('duration_ms', 0))
+        for event in self.traces:
+            stage = event.get('stage', '')
+            operation = event.get('operation', '')
+            if stage in ('serialize', 'mq_produce') and operation in ('Insert', 'Upsert'):
+                write_stages[stage].append(event.get('duration_ms', 0))
+            elif stage in ('consume_lag', 'datanode_process'):
+                write_stages[stage].append(event.get('duration_ms', 0))
+            elif stage == 's3_write':
+                write_stages[stage].append(event.get('duration_ms', 0))
 
         return {stage: self._calc_stats(durs) for stage, durs in write_stages.items()}
 
@@ -141,25 +158,27 @@ class LatencyAnalyzer:
         route_latency: List[float] = []
         growing_hits = 0
         sealed_hits = 0
-        total_searches = 0
+        search_trace_ids = set()
+        segment_stats_without_counts = 0
 
-        for trace_id, events in self.traces_by_id.items():
-            if events[0].get('operation', '') not in ('Search', 'Query'):
+        for event in self.traces:
+            if event.get('operation', '') not in ('Search', 'Query'):
                 continue
-            total_searches += 1
-            for event in events:
-                stage = event.get('stage', '')
-                if stage == 'route':
-                    route_latency.append(event.get('duration_ms', 0))
-                elif stage == 'segment_stats':
-                    # Extract segment counts from metadata fields
-                    growing_hits += event.get('growing_segments', 0)
-                    sealed_hits += event.get('sealed_segments', 0)
+            search_trace_ids.add(event.get('trace_id', ''))
+            stage = event.get('stage', '')
+            if stage == 'route':
+                route_latency.append(event.get('duration_ms', 0))
+            elif stage == 'segment_stats':
+                if 'growing_segments' not in event and 'sealed_segments' not in event:
+                    segment_stats_without_counts += 1
+                growing_hits += event.get('growing_segments', 0)
+                sealed_hits += event.get('sealed_segments', 0)
 
         stats: Dict = {
-            'total_searches': total_searches,
+            'total_searches': len(search_trace_ids) if search_trace_ids else len(route_latency),
             'growing_segment_hits': growing_hits,
             'sealed_segment_hits': sealed_hits,
+            'segment_stats_without_counts': segment_stats_without_counts,
         }
         if route_latency:
             stats['route_latency'] = self._calc_stats(route_latency)
@@ -265,6 +284,11 @@ class LatencyAnalyzer:
         print(f"\nTotal searches: {stats.get('total_searches', 0)}")
         print(f"Growing segment hits: {stats.get('growing_segment_hits', 0)}")
         print(f"Sealed segment hits:  {stats.get('sealed_segment_hits', 0)}")
+        if stats.get('segment_stats_without_counts', 0):
+            print(
+                f"Segment stats without counts: {stats['segment_stats_without_counts']} "
+                "(log was produced before metadata fields were emitted, or metadata was malformed)"
+            )
         if isinstance(stats.get('route_latency'), dict):
             print("\nRoute latency:")
             self._print_stats_dict(stats['route_latency'], indent="  ")
@@ -294,7 +318,8 @@ class LatencyAnalyzer:
             print(f"   - Mean latency: {mean_load:.2f} ms")
             print(f"   - P95 latency:  {p95_load:.2f} ms")
             print(f"   💡 OPTIMIZATION: Shared memory pool can eliminate this latency")
-            print(f"      Expected QPS improvement: ~{(1000/mean_load)*seg_stats['count']:.1f} ops/sec")
+            if mean_load > 0:
+                print(f"      Expected QPS improvement: ~{(1000/mean_load)*seg_stats['count']:.1f} ops/sec")
 
         if write_stats.get('s3_write', {}).get('count', 0) > 0:
             print(f"\n2. DATANODE S3 WRITE:")
