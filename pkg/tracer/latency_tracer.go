@@ -145,15 +145,25 @@ func (t *LatencyTracer) RecordEvent(traceID, requestID, operation, stage, compon
 
 // recordEvent writes a trace event directly to stdout in a grep-friendly,
 // fixed-format line consistent with other Milvus log output.
-// Format: [LATENCY_TRACE] trace_id=<id> operation=<op> stage=<stage> component=<comp> duration_ms=<ms>
+// Format: [LATENCY_TRACE] trace_id=<id> operation=<op> stage=<stage> component=<comp> duration_ms=<ms> [metadata fields]
 func (t *LatencyTracer) recordEvent(event TraceEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	fmt.Fprintf(os.Stdout,
-		"[LATENCY_TRACE] trace_id=%s operation=%s stage=%s component=%s duration_ms=%.2f\n",
+	// Build base output
+	output := fmt.Sprintf(
+		"[LATENCY_TRACE] trace_id=%s operation=%s stage=%s component=%s duration_ms=%.2f",
 		event.TraceID, event.Operation, event.Stage, event.Component, event.Duration,
 	)
+
+	// Append metadata fields if present
+	if len(event.Metadata) > 0 {
+		for key, value := range event.Metadata {
+			output += fmt.Sprintf(" %s=%v", key, value)
+		}
+	}
+
+	fmt.Fprintln(os.Stdout, output)
 }
 
 // Helper functions for common operations

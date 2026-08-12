@@ -38,6 +38,7 @@ except ImportError:
 
 # Matches lines like:
 #   [LATENCY_TRACE] trace_id=abc operation=Insert stage=serialize component=proxy duration_ms=1.23
+#   [LATENCY_TRACE] trace_id=abc operation=Search stage=segment_stats component=querynode duration_ms=0.00 sealed_segments=5 growing_segments=2
 _TRACE_RE = re.compile(
     r'\[LATENCY_TRACE\]\s+'
     r'trace_id=(\S+)\s+'
@@ -45,6 +46,7 @@ _TRACE_RE = re.compile(
     r'stage=(\S+)\s+'
     r'component=(\S+)\s+'
     r'duration_ms=([\d.]+)'
+    r'(.*)'  # Capture remaining line for metadata parsing
 )
 
 
@@ -53,13 +55,33 @@ def parse_trace_line(line: str) -> Optional[dict]:
     m = _TRACE_RE.search(line)
     if not m:
         return None
-    return {
+
+    result = {
         'trace_id':   m.group(1),
         'operation':  m.group(2),
         'stage':      m.group(3),
         'component':  m.group(4),
         'duration_ms': float(m.group(5)),
     }
+
+    # Parse metadata fields from remaining text (group 6)
+    metadata_text = m.group(6).strip()
+    if metadata_text:
+        # Match key=value pairs in the metadata section
+        metadata_re = re.compile(r'(\w+)=([\d.]+)')
+        for match in metadata_re.finditer(metadata_text):
+            key = match.group(1)
+            value = match.group(2)
+            # Try to parse as int first, then float
+            try:
+                result[key] = int(value)
+            except ValueError:
+                try:
+                    result[key] = float(value)
+                except ValueError:
+                    result[key] = value
+
+    return result
 
 
 class LatencyAnalyzer:
@@ -130,9 +152,9 @@ class LatencyAnalyzer:
                 if stage == 'route':
                     route_latency.append(event.get('duration_ms', 0))
                 elif stage == 'segment_stats':
-                    # segment counts are encoded in the log line via extra fields
-                    # (not present in the compact stdout format; tracked via separate events)
-                    pass
+                    # Extract segment counts from metadata fields
+                    growing_hits += event.get('growing_segments', 0)
+                    sealed_hits += event.get('sealed_segments', 0)
 
         stats: Dict = {
             'total_searches': total_searches,
