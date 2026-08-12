@@ -396,7 +396,7 @@ func (loader *segmentLoaderV2) LoadSegment(ctx context.Context,
 ) (err error) {
 	// Trace: start load segment span
 	loadSpan := tracer.GetGlobalTracer().StartSpan(
-		"", // trace ID from context if available
+		tracer.GetTraceIDFromContext(ctx),
 		"",
 		"LoadSegment",
 		"total_load",
@@ -1108,6 +1108,23 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 	segment *LocalSegment,
 	loadInfo *querypb.SegmentLoadInfo,
 ) (err error) {
+	loadSpan := tracer.GetGlobalTracer().StartSpan(
+		tracer.GetTraceIDFromContext(ctx),
+		"",
+		"LoadSegment",
+		"total_load",
+		"querynode",
+		map[string]interface{}{
+			"segment_id":      segment.ID(),
+			"collection_id":   segment.Collection(),
+			"partition_id":    segment.Partition(),
+			"num_rows":        loadInfo.GetNumOfRows(),
+			"segment_type":    segment.Type().String(),
+			"storage_version": loadInfo.GetStorageVersion(),
+		},
+	)
+	defer tracer.EndTrace(loadSpan)
+
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", segment.Collection()),
 		zap.Int64("partitionID", segment.Partition()),

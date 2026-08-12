@@ -69,7 +69,7 @@ def parse_trace_line(line: str) -> Optional[dict]:
     if metadata_text:
         # Match key=value pairs in the metadata section. Values may be numeric
         # or strings such as channel names and segment levels.
-        metadata_re = re.compile(r'(\w+)=("[^"]*"|\S+)')
+        metadata_re = re.compile(r'(\w+)=((?:\[[^\]]*\])|"[^"]*"|\S+)')
         for match in metadata_re.finditer(metadata_text):
             key = match.group(1)
             value = match.group(2).strip('"')
@@ -156,29 +156,48 @@ class LatencyAnalyzer:
     def analyze_search_path(self) -> Dict:
         """Analyze search/query path latencies."""
         route_latency: List[float] = []
-        growing_hits = 0
-        sealed_hits = 0
         search_trace_ids = set()
+        segment_counts_by_trace: Dict[str, dict] = defaultdict(dict)
         segment_stats_without_counts = 0
 
         for event in self.traces:
             if event.get('operation', '') not in ('Search', 'Query'):
                 continue
-            search_trace_ids.add(event.get('trace_id', ''))
+            trace_id = event.get('trace_id', '')
+            search_trace_ids.add(trace_id)
             stage = event.get('stage', '')
             if stage == 'route':
                 route_latency.append(event.get('duration_ms', 0))
+                if 'sealed_count' in event or 'growing_count' in event:
+                    segment_counts_by_trace[trace_id]['route_sealed'] = event.get('sealed_count', 0)
+                    segment_counts_by_trace[trace_id]['route_growing'] = event.get('growing_count', 0)
             elif stage == 'segment_stats':
                 if 'growing_segments' not in event and 'sealed_segments' not in event:
                     segment_stats_without_counts += 1
-                growing_hits += event.get('growing_segments', 0)
-                sealed_hits += event.get('sealed_segments', 0)
+                if 'sealed_segments' in event:
+                    segment_counts_by_trace[trace_id]['stats_sealed'] = event.get('sealed_segments', 0)
+                if 'growing_segments' in event:
+                    segment_counts_by_trace[trace_id]['stats_growing'] = event.get('growing_segments', 0)
+
+        growing_hits = 0
+        sealed_hits = 0
+        route_count_fallbacks = 0
+        for counts in segment_counts_by_trace.values():
+            if 'stats_sealed' in counts or 'stats_growing' in counts:
+                sealed_hits += counts.get('stats_sealed', 0)
+                growing_hits += counts.get('stats_growing', 0)
+            else:
+                sealed_hits += counts.get('route_sealed', 0)
+                growing_hits += counts.get('route_growing', 0)
+                if 'route_sealed' in counts or 'route_growing' in counts:
+                    route_count_fallbacks += 1
 
         stats: Dict = {
             'total_searches': len(search_trace_ids) if search_trace_ids else len(route_latency),
             'growing_segment_hits': growing_hits,
             'sealed_segment_hits': sealed_hits,
             'segment_stats_without_counts': segment_stats_without_counts,
+            'route_count_fallbacks': route_count_fallbacks,
         }
         if route_latency:
             stats['route_latency'] = self._calc_stats(route_latency)
@@ -289,6 +308,8 @@ class LatencyAnalyzer:
                 f"Segment stats without counts: {stats['segment_stats_without_counts']} "
                 "(log was produced before metadata fields were emitted, or metadata was malformed)"
             )
+        if stats.get('route_count_fallbacks', 0):
+            print(f"Segment counts read from route metadata: {stats['route_count_fallbacks']}")
         if isinstance(stats.get('route_latency'), dict):
             print("\nRoute latency:")
             self._print_stats_dict(stats['route_latency'], indent="  ")
