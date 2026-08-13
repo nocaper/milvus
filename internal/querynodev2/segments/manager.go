@@ -39,6 +39,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/eventlog"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/tracer"
 	"github.com/milvus-io/milvus/pkg/util/cache"
 	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/metautil"
@@ -201,6 +202,28 @@ func NewManager() *Manager {
 			if collection == nil {
 				return nil, merr.WrapErrCollectionNotLoaded(segment.Collection(), "failed to load segment fields")
 			}
+
+			requestOperation := getLatencyTraceOperation(ctx)
+			if requestOperation == "" {
+				requestOperation = "Unknown"
+			}
+			loadSpan := tracer.GetGlobalTracer().StartSpan(
+				tracer.GetTraceIDFromContext(ctx),
+				"",
+				"LoadSegment",
+				"segment_cache_load",
+				"querynode",
+				map[string]interface{}{
+					"source":        "object_store",
+					"collection_id": segment.Collection(),
+					"partition_id":  segment.Partition(),
+					"segment_id":    segment.ID(),
+					"segment_type":  segment.Type().String(),
+					"num_rows":      info.GetNumOfRows(),
+					"trigger":       requestOperation,
+				},
+			)
+			defer tracer.EndTrace(loadSpan)
 
 			err = manager.Loader.LoadLazySegment(ctx, segment.(*LocalSegment), info)
 			return nil, err

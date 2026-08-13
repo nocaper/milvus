@@ -71,6 +71,25 @@ const (
 
 var errRetryTimerNotified = errors.New("retry timer notified")
 
+func traceSegmentLoadStage(ctx context.Context, stage string, segment *LocalSegment, metadata map[string]interface{}) *tracer.SpanContext {
+	if metadata == nil {
+		metadata = make(map[string]interface{})
+	}
+	metadata["source"] = "object_store"
+	metadata["collection_id"] = segment.Collection()
+	metadata["partition_id"] = segment.Partition()
+	metadata["segment_id"] = segment.ID()
+	metadata["segment_type"] = segment.Type().String()
+	return tracer.GetGlobalTracer().StartSpan(
+		tracer.GetTraceIDFromContext(ctx),
+		"",
+		"LoadSegment",
+		stage,
+		"querynode",
+		metadata,
+	)
+}
+
 type Loader interface {
 	// Load loads binlogs, and spawn segments,
 	// NOTE: make sure the ref count of the corresponding collection will never go down to 0 during this
@@ -395,20 +414,9 @@ func (loader *segmentLoaderV2) LoadSegment(ctx context.Context,
 	loadInfo *querypb.SegmentLoadInfo,
 ) (err error) {
 	// Trace: start load segment span
-	loadSpan := tracer.GetGlobalTracer().StartSpan(
-		tracer.GetTraceIDFromContext(ctx),
-		"",
-		"LoadSegment",
-		"total_load",
-		"querynode",
-		map[string]interface{}{
-			"segment_id":   segment.ID(),
-			"collection_id": segment.Collection(),
-			"partition_id":  segment.Partition(),
-			"num_rows":      loadInfo.GetNumOfRows(),
-			"segment_type":  segment.Type().String(),
-		},
-	)
+	loadSpan := traceSegmentLoadStage(ctx, "total_load", segment, map[string]interface{}{
+		"num_rows": loadInfo.GetNumOfRows(),
+	})
 	defer tracer.EndTrace(loadSpan)
 
 	// TODO: we should create a transaction-like api to load segment for segment interface,
@@ -973,7 +981,7 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 
 		log.Info("loading bloom filter for remote...")
 		pkStatsBinlogs, logType := loader.filterPKStatsBinlogs(loadInfo.Statslogs, pkField.GetFieldID())
-		err := loader.loadBloomFilter(ctx, segmentID, bfs, pkStatsBinlogs, logType)
+		err := loader.loadBloomFilter(ctx, segmentID, nil, bfs, pkStatsBinlogs, logType)
 		if err != nil {
 			log.Warn("load remote segment bloom filter failed",
 				zap.Int64("partitionID", partitionID),
@@ -1108,21 +1116,10 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 	segment *LocalSegment,
 	loadInfo *querypb.SegmentLoadInfo,
 ) (err error) {
-	loadSpan := tracer.GetGlobalTracer().StartSpan(
-		tracer.GetTraceIDFromContext(ctx),
-		"",
-		"LoadSegment",
-		"total_load",
-		"querynode",
-		map[string]interface{}{
-			"segment_id":      segment.ID(),
-			"collection_id":   segment.Collection(),
-			"partition_id":    segment.Partition(),
-			"num_rows":        loadInfo.GetNumOfRows(),
-			"segment_type":    segment.Type().String(),
-			"storage_version": loadInfo.GetStorageVersion(),
-		},
-	)
+	loadSpan := traceSegmentLoadStage(ctx, "total_load", segment, map[string]interface{}{
+		"num_rows":        loadInfo.GetNumOfRows(),
+		"storage_version": loadInfo.GetStorageVersion(),
+	})
 	defer tracer.EndTrace(loadSpan)
 
 	log := log.Ctx(ctx).With(
@@ -1161,7 +1158,7 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 	if segment.segmentType == SegmentTypeGrowing {
 		log.Info("loading statslog...")
 		pkStatsBinlogs, logType := loader.filterPKStatsBinlogs(loadInfo.Statslogs, pkField.GetFieldID())
-		err := loader.loadBloomFilter(ctx, segment.ID(), segment.bloomFilterSet, pkStatsBinlogs, logType)
+		err := loader.loadBloomFilter(ctx, segment.ID(), segment, segment.bloomFilterSet, pkStatsBinlogs, logType)
 		if err != nil {
 			return err
 		}
@@ -1332,7 +1329,7 @@ func (loader *segmentLoader) loadFieldIndex(ctx context.Context, segment *LocalS
 	return segment.LoadIndex(ctx, indexInfo, fieldType)
 }
 
-func (loader *segmentLoader) loadBloomFilter(ctx context.Context, segmentID int64, bfs *pkoracle.BloomFilterSet,
+func (loader *segmentLoader) loadBloomFilter(ctx context.Context, segmentID int64, segment *LocalSegment, bfs *pkoracle.BloomFilterSet,
 	binlogPaths []string, logType storage.StatsLogType,
 ) error {
 	log := log.Ctx(ctx).With(
@@ -1341,6 +1338,15 @@ func (loader *segmentLoader) loadBloomFilter(ctx context.Context, segmentID int6
 	if len(binlogPaths) == 0 {
 		log.Info("there are no stats logs saved with segment")
 		return nil
+	}
+
+	var loadSpan *tracer.SpanContext
+	if segment != nil {
+		loadSpan = traceSegmentLoadStage(ctx, "load_bloom_filter", segment, map[string]interface{}{
+			"binlog_count": len(binlogPaths),
+			"log_type":     logType,
+		})
+		defer tracer.EndTrace(loadSpan)
 	}
 
 	startTs := time.Now()
@@ -1354,19 +1360,29 @@ func (loader *segmentLoader) loadBloomFilter(ctx context.Context, segmentID int6
 	}
 
 	var stats []*storage.PrimaryKeyStats
+	var deserializeSpan *tracer.SpanContext
+	if segment != nil {
+		deserializeSpan = traceSegmentLoadStage(ctx, "deserialize_stats", segment, map[string]interface{}{
+			"blob_count": len(blobs),
+			"log_type":   logType,
+		})
+	}
 	if logType == storage.CompoundStatsType {
 		stats, err = storage.DeserializeStatsList(blobs[0])
 		if err != nil {
+			tracer.EndTrace(deserializeSpan)
 			log.Warn("failed to deserialize stats list", zap.Error(err))
 			return err
 		}
 	} else {
 		stats, err = storage.DeserializeStats(blobs)
 		if err != nil {
+			tracer.EndTrace(deserializeSpan)
 			log.Warn("failed to deserialize stats", zap.Error(err))
 			return err
 		}
 	}
+	tracer.EndTrace(deserializeSpan)
 
 	var size uint
 	for _, stat := range stats {
@@ -1390,6 +1406,14 @@ func (loader *segmentLoader) LoadDeltaLogs(ctx context.Context, segment Segment,
 		zap.Int("deltaNum", len(deltaLogs)),
 	)
 	log.Info("loading delta...")
+
+	var loadSpan *tracer.SpanContext
+	if localSegment, ok := segment.(*LocalSegment); ok {
+		loadSpan = traceSegmentLoadStage(ctx, "load_delta_logs", localSegment, map[string]interface{}{
+			"field_binlog_count": len(deltaLogs),
+		})
+		defer tracer.EndTrace(loadSpan)
+	}
 
 	dCodec := storage.DeleteCodec{}
 	var blobs []*storage.Blob
@@ -1427,15 +1451,31 @@ func (loader *segmentLoader) LoadDeltaLogs(ctx context.Context, segment Segment,
 		log.Info("there are no delta logs saved with segment, skip loading delete record")
 		return nil
 	}
+	var deserializeSpan *tracer.SpanContext
+	if localSegment, ok := segment.(*LocalSegment); ok {
+		deserializeSpan = traceSegmentLoadStage(ctx, "deserialize_delta", localSegment, map[string]interface{}{
+			"blob_count": len(blobs),
+		})
+	}
 	_, _, deltaData, err := dCodec.Deserialize(blobs)
 	if err != nil {
+		tracer.EndTrace(deserializeSpan)
 		return err
 	}
+	tracer.EndTrace(deserializeSpan)
 
+	var applySpan *tracer.SpanContext
+	if localSegment, ok := segment.(*LocalSegment); ok {
+		applySpan = traceSegmentLoadStage(ctx, "load_delta_apply", localSegment, map[string]interface{}{
+			"delete_count": deltaData.RowCount,
+		})
+	}
 	err = segment.LoadDeltaData(ctx, deltaData)
 	if err != nil {
+		tracer.EndTrace(applySpan)
 		return err
 	}
+	tracer.EndTrace(applySpan)
 
 	log.Info("load delta logs done", zap.Int64("deleteCount", deltaData.RowCount))
 	return nil

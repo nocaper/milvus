@@ -138,6 +138,7 @@ class LatencyAnalyzer:
             'mq_produce': [],
             'consume_lag': [],
             'datanode_process': [],
+            'datanode_serialize': [],
             's3_write': [],
         }
 
@@ -150,24 +151,30 @@ class LatencyAnalyzer:
                 write_stages[stage].append(event.get('duration_ms', 0))
             elif stage == 's3_write':
                 write_stages[stage].append(event.get('duration_ms', 0))
+                if 'serialize_ms' in event:
+                    write_stages['datanode_serialize'].append(event.get('serialize_ms', 0))
 
         return {stage: self._calc_stats(durs) for stage, durs in write_stages.items()}
 
     def analyze_search_path(self) -> Dict:
         """Analyze search/query path latencies."""
-        route_latency: List[float] = []
-        search_trace_ids = set()
+        route_latency: Dict[str, List[float]] = defaultdict(list)
+        trace_ids_by_operation: Dict[str, set] = defaultdict(set)
         segment_counts_by_trace: Dict[str, dict] = defaultdict(dict)
+        cache_hits_by_operation: Dict[str, int] = defaultdict(int)
+        cache_misses_by_operation: Dict[str, int] = defaultdict(int)
         segment_stats_without_counts = 0
 
         for event in self.traces:
-            if event.get('operation', '') not in ('Search', 'Query'):
+            operation = event.get('operation', '')
+            if operation not in ('Search', 'Query'):
                 continue
             trace_id = event.get('trace_id', '')
-            search_trace_ids.add(trace_id)
             stage = event.get('stage', '')
+            if stage in ('route', 'segment_stats'):
+                trace_ids_by_operation[operation].add(trace_id)
             if stage == 'route':
-                route_latency.append(event.get('duration_ms', 0))
+                route_latency[operation].append(event.get('duration_ms', 0))
                 if 'sealed_count' in event or 'growing_count' in event:
                     segment_counts_by_trace[trace_id]['route_sealed'] = event.get('sealed_count', 0)
                     segment_counts_by_trace[trace_id]['route_growing'] = event.get('growing_count', 0)
@@ -178,30 +185,72 @@ class LatencyAnalyzer:
                     segment_counts_by_trace[trace_id]['stats_sealed'] = event.get('sealed_segments', 0)
                 if 'growing_segments' in event:
                     segment_counts_by_trace[trace_id]['stats_growing'] = event.get('growing_segments', 0)
+            elif stage == 'segment_cache_hit':
+                cache_hits_by_operation[operation] += 1
+            elif stage == 'segment_cache_miss':
+                cache_misses_by_operation[operation] += 1
 
         growing_hits = 0
         sealed_hits = 0
         route_count_fallbacks = 0
+        traces_with_segment_counts = 0
         for counts in segment_counts_by_trace.values():
             if 'stats_sealed' in counts or 'stats_growing' in counts:
                 sealed_hits += counts.get('stats_sealed', 0)
                 growing_hits += counts.get('stats_growing', 0)
+                traces_with_segment_counts += 1
             else:
                 sealed_hits += counts.get('route_sealed', 0)
                 growing_hits += counts.get('route_growing', 0)
                 if 'route_sealed' in counts or 'route_growing' in counts:
                     route_count_fallbacks += 1
+                    traces_with_segment_counts += 1
 
         stats: Dict = {
-            'total_searches': len(search_trace_ids) if search_trace_ids else len(route_latency),
+            'total_requests': sum(len(v) for v in trace_ids_by_operation.values()),
+            'search_requests': len(trace_ids_by_operation.get('Search', set())),
+            'query_requests': len(trace_ids_by_operation.get('Query', set())),
             'growing_segment_hits': growing_hits,
             'sealed_segment_hits': sealed_hits,
+            'traces_with_segment_counts': traces_with_segment_counts,
             'segment_stats_without_counts': segment_stats_without_counts,
             'route_count_fallbacks': route_count_fallbacks,
+            'cache_hits_by_operation': dict(cache_hits_by_operation),
+            'cache_misses_by_operation': dict(cache_misses_by_operation),
+            'route_latency': {
+                op: self._calc_stats(durs)
+                for op, durs in route_latency.items()
+            },
         }
-        if route_latency:
-            stats['route_latency'] = self._calc_stats(route_latency)
         return stats
+
+    def analyze_querynode_cache_execution(self) -> Dict:
+        """Analyze per-segment execution once data is already in QueryNode memory/cache."""
+        buckets = {
+            'search_segment_cache_execution': [],
+            'query_segment_cache_execution': [],
+        }
+        by_segment_type: Dict[str, List[float]] = defaultdict(list)
+
+        for event in self.traces:
+            operation = event.get('operation')
+            stage = event.get('stage')
+            if operation == 'Search' and stage == 'segment_search':
+                duration = event.get('duration_ms', 0)
+                buckets['search_segment_cache_execution'].append(duration)
+                by_segment_type[str(event.get('segment_type', 'unknown'))].append(duration)
+            elif operation == 'Query' and stage == 'segment_query':
+                duration = event.get('duration_ms', 0)
+                buckets['query_segment_cache_execution'].append(duration)
+                by_segment_type[str(event.get('segment_type', 'unknown'))].append(duration)
+
+        return {
+            'stages': {name: self._calc_stats(durs) for name, durs in buckets.items()},
+            'by_segment_type': {
+                name: self._calc_stats(durs)
+                for name, durs in sorted(by_segment_type.items())
+            },
+        }
 
     def analyze_load_operations(self) -> Dict:
         """Analyze LoadCollection/LoadPartition operations."""
@@ -214,15 +263,60 @@ class LatencyAnalyzer:
 
         return self._calc_stats(load_latencies)
 
+    def _trace_request_operations(self) -> Dict[str, str]:
+        """Map trace IDs to the request operation that created them."""
+        trace_ops: Dict[str, str] = {}
+        for event in self.traces:
+            op = event.get('operation')
+            stage = event.get('stage')
+            if op in ('Search', 'Query') and stage in ('route', 'segment_stats', 'segment_search', 'segment_query'):
+                trace_ops[event.get('trace_id', '')] = op
+        return trace_ops
+
     def analyze_segment_loads(self) -> Dict:
-        """Analyze individual segment load operations (key optimization target)."""
-        durations: List[float] = []
+        """Analyze segment loads from object storage/cold cache paths."""
+        total_load: List[float] = []
+        cache_miss_load: List[float] = []
+        load_substages: Dict[str, List[float]] = defaultdict(list)
+        by_request_operation: Dict[str, List[float]] = defaultdict(list)
+        trace_ops = self._trace_request_operations()
+        substage_names = {
+            'load_index',
+            'load_field_data',
+            'load_multi_field_data',
+            'load_bloom_filter',
+            'deserialize_stats',
+            'load_delta_logs',
+            'deserialize_delta',
+            'load_delta_apply',
+        }
 
         for event in self.traces:
-            if event.get('operation') == 'LoadSegment' and event.get('stage') == 'total_load':
-                durations.append(event.get('duration_ms', 0))
+            if event.get('operation') != 'LoadSegment':
+                continue
+            stage = event.get('stage')
+            duration = event.get('duration_ms', 0)
+            if stage == 'total_load':
+                total_load.append(duration)
+            elif stage == 'segment_cache_load':
+                cache_miss_load.append(duration)
+                trigger = str(event.get('trigger') or trace_ops.get(event.get('trace_id', ''), 'Unknown'))
+                by_request_operation[trigger].append(duration)
+            elif stage in substage_names:
+                load_substages[stage].append(duration)
 
-        return self._calc_stats(durations)
+        return {
+            'total_load': self._calc_stats(total_load),
+            'cache_miss_load': self._calc_stats(cache_miss_load),
+            'substages': {
+                stage: self._calc_stats(durs)
+                for stage, durs in sorted(load_substages.items())
+            },
+            'cache_miss_by_request_operation': {
+                op: self._calc_stats(durs)
+                for op, durs in sorted(by_request_operation.items())
+            },
+        }
 
     # ------------------------------------------------------------------
     # Report generation
@@ -242,6 +336,7 @@ class LatencyAnalyzer:
         search_stats = self.analyze_search_path()
         load_stats = self.analyze_load_operations()
         seg_stats = self.analyze_segment_loads()
+        cache_exec_stats = self.analyze_querynode_cache_execution()
 
         print("\n### WRITE PATH ANALYSIS (Insert/Upsert)")
         print("-" * 80)
@@ -257,16 +352,20 @@ class LatencyAnalyzer:
 
         print("\n### SEGMENT LOAD ANALYSIS (OPTIMIZATION TARGET)")
         print("-" * 80)
-        self._print_stats_dict(seg_stats, "Segment Load from S3")
+        self._print_segment_load_stats(seg_stats)
+
+        print("\n### QUERYNODE CACHE EXECUTION ANALYSIS")
+        print("-" * 80)
+        self._print_cache_execution_stats(cache_exec_stats)
 
         print("\n### BOTTLENECK SUMMARY & OPTIMIZATION OPPORTUNITIES")
         print("-" * 80)
-        self._print_bottleneck_summary(write_stats, search_stats, seg_stats)
+        self._print_bottleneck_summary(write_stats, search_stats, seg_stats, cache_exec_stats)
 
         if HAS_PLOT_DEPS:
             self._save_to_csv(output_path)
-            self._generate_plots(output_path, write_stats, search_stats, seg_stats)
-            print(f"\n✓ CSV and plots saved to {output_path}")
+            self._generate_plots(output_path, write_stats, search_stats, seg_stats, cache_exec_stats)
+            print(f"\nCSV and plots saved to {output_path}")
         else:
             print("\n(Install pandas/matplotlib/seaborn for CSV export and plots)")
 
@@ -300,9 +399,17 @@ class LatencyAnalyzer:
                 print(f"  Min/Max:  {data['min']:.2f} / {data['max']:.2f} ms")
 
     def _print_search_stats(self, stats: Dict):
-        print(f"\nTotal searches: {stats.get('total_searches', 0)}")
-        print(f"Growing segment hits: {stats.get('growing_segment_hits', 0)}")
-        print(f"Sealed segment hits:  {stats.get('sealed_segment_hits', 0)}")
+        print(f"\nTotal search/query requests: {stats.get('total_requests', 0)}")
+        print(f"Search requests:            {stats.get('search_requests', 0)}")
+        print(f"Query requests:             {stats.get('query_requests', 0)}")
+        print(f"Growing segment hits:       {stats.get('growing_segment_hits', 0)}")
+        print(f"Sealed segment hits:        {stats.get('sealed_segment_hits', 0)}")
+        print(f"Traces with segment counts: {stats.get('traces_with_segment_counts', 0)}")
+        for operation in ('Search', 'Query'):
+            hits = stats.get('cache_hits_by_operation', {}).get(operation, 0)
+            misses = stats.get('cache_misses_by_operation', {}).get(operation, 0)
+            if hits or misses:
+                print(f"{operation} QueryNode cache hits/misses: {hits} / {misses}")
         if stats.get('segment_stats_without_counts', 0):
             print(
                 f"Segment stats without counts: {stats['segment_stats_without_counts']} "
@@ -310,9 +417,44 @@ class LatencyAnalyzer:
             )
         if stats.get('route_count_fallbacks', 0):
             print(f"Segment counts read from route metadata: {stats['route_count_fallbacks']}")
-        if isinstance(stats.get('route_latency'), dict):
-            print("\nRoute latency:")
-            self._print_stats_dict(stats['route_latency'], indent="  ")
+        if (
+            not stats.get('cache_hits_by_operation')
+            and not stats.get('cache_misses_by_operation')
+        ):
+            print("Lazy-load disk cache hits/misses: No data")
+        route_latency = stats.get('route_latency', {})
+        for operation in ('Search', 'Query'):
+            op_stats = route_latency.get(operation, {})
+            if op_stats.get('count', 0) > 0:
+                print(f"\n{operation} route latency:")
+                self._print_stats_dict(op_stats, indent="  ")
+
+    def _print_segment_load_stats(self, stats: Dict):
+        self._print_stats_dict(stats.get('cache_miss_load', {}), "Query/Search cache-miss load from object store")
+        self._print_stats_dict(stats.get('total_load', {}), "All LoadSegment total load")
+
+        by_op = stats.get('cache_miss_by_request_operation', {})
+        for operation in ('Search', 'Query', 'Unknown'):
+            op_stats = by_op.get(operation, {})
+            if op_stats.get('count', 0) > 0:
+                self._print_stats_dict(op_stats, f"Cache-miss load during {operation}", indent="  ")
+
+        substages = stats.get('substages', {})
+        if substages:
+            print("\nLoad substages:")
+            for stage, stage_stats in substages.items():
+                self._print_stats_dict(stage_stats, stage, indent="  ")
+
+    def _print_cache_execution_stats(self, stats: Dict):
+        stages = stats.get('stages', {})
+        self._print_stats_dict(stages.get('search_segment_cache_execution', {}), "Search segment execution on QueryNode cache")
+        self._print_stats_dict(stages.get('query_segment_cache_execution', {}), "Query segment execution on QueryNode cache")
+
+        by_type = stats.get('by_segment_type', {})
+        if by_type:
+            print("\nBy segment type:")
+            for segment_type, type_stats in by_type.items():
+                self._print_stats_dict(type_stats, segment_type, indent="  ")
 
     def _print_stats_dict(self, data: Dict, label: str = "", indent: str = ""):
         if data.get('count', 0) > 0:
@@ -328,39 +470,54 @@ class LatencyAnalyzer:
         else:
             print(f"{indent}{label}: No data")
 
-    def _print_bottleneck_summary(self, write_stats, search_stats, seg_stats):
-        print("\n🎯 KEY FINDINGS:")
+    def _print_bottleneck_summary(self, write_stats, search_stats, seg_stats, cache_exec_stats):
+        print("\nKEY FINDINGS:")
 
-        if seg_stats.get('count', 0) > 0:
-            mean_load = seg_stats['mean']
-            p95_load  = seg_stats['p95']
-            print(f"\n1. SEGMENT LOAD FROM S3 (Primary Optimization Target):")
-            print(f"   - {seg_stats['count']} segment loads observed")
-            print(f"   - Mean latency: {mean_load:.2f} ms")
-            print(f"   - P95 latency:  {p95_load:.2f} ms")
-            print(f"   💡 OPTIMIZATION: Shared memory pool can eliminate this latency")
-            if mean_load > 0:
-                print(f"      Expected QPS improvement: ~{(1000/mean_load)*seg_stats['count']:.1f} ops/sec")
+        cache_miss_load = seg_stats.get('cache_miss_load', {})
+        total_load = seg_stats.get('total_load', {})
+        hot_search = cache_exec_stats.get('stages', {}).get('search_segment_cache_execution', {})
+        hot_query = cache_exec_stats.get('stages', {}).get('query_segment_cache_execution', {})
+
+        if cache_miss_load.get('count', 0) > 0:
+            print("\n1. QUERY/SEARCH CACHE MISS LOAD FROM OBJECT STORE:")
+            print(f"   - {cache_miss_load['count']} cache-miss segment loads observed")
+            print(f"   - Mean latency: {cache_miss_load['mean']:.2f} ms")
+            print(f"   - P95 latency:  {cache_miss_load['p95']:.2f} ms")
+            print("   - This is the cold path most directly affected by avoiding object-store reads.")
+        elif total_load.get('count', 0) > 0:
+            print("\n1. SEGMENT LOAD FROM OBJECT STORE:")
+            print(f"   - {total_load['count']} segment loads observed outside a traced query/search request")
+            print(f"   - Mean latency: {total_load['mean']:.2f} ms")
+            print(f"   - P95 latency:  {total_load['p95']:.2f} ms")
+        else:
+            print("\n1. SEGMENT LOAD FROM OBJECT STORE:")
+            print("   - No LoadSegment events found.")
 
         if write_stats.get('s3_write', {}).get('count', 0) > 0:
-            print(f"\n2. DATANODE S3 WRITE:")
+            print("\n2. DATANODE S3 WRITE:")
             print(f"   - Mean latency: {write_stats['s3_write']['mean']:.2f} ms")
-            print(f"   💡 OPTIMIZATION: Can be parallelized with shared memory push")
+            if write_stats.get('datanode_serialize', {}).get('count', 0) > 0:
+                print(f"   - Serialize before write mean: {write_stats['datanode_serialize']['mean']:.2f} ms")
 
-        total = search_stats.get('total_searches', 0)
+        total = search_stats.get('total_requests', 0)
         if total > 0:
-            print(f"\n3. SEARCH PATTERN ANALYSIS:")
-            print(f"   - Total searches:          {total}")
-            print(f"   - Growing segment queries: {search_stats.get('growing_segment_hits', 0)}")
-            print(f"   - Sealed segment queries:  {search_stats.get('sealed_segment_hits', 0)}")
-            print(f"   💡 Sealed segment queries benefit most from shared memory optimization")
+            print("\n3. SEARCH/QUERY PATTERN:")
+            print(f"   - Total requests:       {total}")
+            print(f"   - Search requests:      {search_stats.get('search_requests', 0)}")
+            print(f"   - Query requests:       {search_stats.get('query_requests', 0)}")
+            print(f"   - Growing segment hits: {search_stats.get('growing_segment_hits', 0)}")
+            print(f"   - Sealed segment hits:  {search_stats.get('sealed_segment_hits', 0)}")
 
-        print("\n📊 EXPECTED OPTIMIZATION IMPACT:")
-        print("   With shared memory pool between DataNode and QueryNode:")
-        print("   ✓ Eliminate S3 read latency for segment loads")
-        print("   ✓ Eliminate deserialization overhead (direct memory access)")
-        print("   ✓ LoadCollection/LoadPartition latency → near zero")
-        print("   ✓ Sealed segment queries: latency reduction = segment_load_latency")
+        if hot_search.get('count', 0) > 0 or hot_query.get('count', 0) > 0:
+            print("\n4. QUERYNODE CACHE EXECUTION:")
+            if hot_search.get('count', 0) > 0:
+                print(f"   - Search cache executions: {hot_search['count']}, mean {hot_search['mean']:.2f} ms")
+            if hot_query.get('count', 0) > 0:
+                print(f"   - Query cache executions:  {hot_query['count']}, mean {hot_query['mean']:.2f} ms")
+
+        print("\nEXPECTED OPTIMIZATION IMPACT:")
+        print("   Compare cache-miss object-store load latency with QueryNode cache execution latency.")
+        print("   If cache-miss load dominates, shared memory or cache reuse targets the right bottleneck.")
 
     def _save_to_csv(self, output_path: Path):
         df = pd.DataFrame(self.traces)
@@ -377,7 +534,7 @@ class LatencyAnalyzer:
         ]
         pd.DataFrame(trace_summary).to_csv(output_path / 'trace_summary.csv', index=False)
 
-    def _generate_plots(self, output_path: Path, write_stats, search_stats, seg_stats):
+    def _generate_plots(self, output_path: Path, write_stats, search_stats, seg_stats, cache_exec_stats):
         sns.set_style("whitegrid")
 
         # Write path stage breakdown
@@ -402,28 +559,34 @@ class LatencyAnalyzer:
             plt.close()
 
         # Segment load distribution
-        if seg_stats.get('count', 0) > 0:
+        load_stats = seg_stats.get('cache_miss_load', {})
+        load_stages = ('segment_cache_load',)
+        if load_stats.get('count', 0) == 0:
+            load_stats = seg_stats.get('total_load', {})
+            load_stages = ('total_load',)
+        if load_stats.get('count', 0) > 0:
             durations = [
                 e.get('duration_ms', 0)
                 for e in self.traces
-                if e.get('operation') == 'LoadSegment' and e.get('stage') == 'total_load'
+                if e.get('operation') == 'LoadSegment'
+                and e.get('stage') in load_stages
             ]
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.hist(durations, bins=30, alpha=0.7, edgecolor='black')
-            ax.axvline(seg_stats['mean'], color='r',      linestyle='--',
-                       label=f"Mean: {seg_stats['mean']:.2f} ms")
-            ax.axvline(seg_stats['p95'],  color='orange', linestyle='--',
-                       label=f"P95: {seg_stats['p95']:.2f} ms")
+            ax.axvline(load_stats['mean'], color='r',      linestyle='--',
+                       label=f"Mean: {load_stats['mean']:.2f} ms")
+            ax.axvline(load_stats['p95'],  color='orange', linestyle='--',
+                       label=f"P95: {load_stats['p95']:.2f} ms")
             ax.set_xlabel('Latency (ms)')
             ax.set_ylabel('Frequency')
-            ax.set_title('Segment Load Latency Distribution (Optimization Target)')
+            ax.set_title('Segment Object-Store Load Latency Distribution')
             ax.legend()
             plt.tight_layout()
             plt.savefig(output_path / 'segment_load_distribution.png', dpi=300)
             plt.close()
 
         # Growing vs Sealed
-        if search_stats.get('total_searches', 0) > 0:
+        if search_stats.get('total_requests', 0) > 0:
             fig, ax = plt.subplots(figsize=(8, 6))
             cats   = ['Growing\nSegments', 'Sealed\nSegments']
             counts = [search_stats.get('growing_segment_hits', 0),

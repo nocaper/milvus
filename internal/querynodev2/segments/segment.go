@@ -56,6 +56,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/tracer"
 	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/metautil"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
@@ -554,6 +555,23 @@ func (s *LocalSegment) Search(ctx context.Context, searchReq *SearchRequest) (*S
 		zap.Int64("segmentID", s.ID()),
 		zap.String("segmentType", s.segmentType.String()),
 	)
+	searchSpan := tracer.GetGlobalTracer().StartSpan(
+		tracer.GetTraceIDFromContext(ctx),
+		"",
+		"Search",
+		"segment_search",
+		"querynode",
+		map[string]interface{}{
+			"source":        "querynode_cache",
+			"collection_id": s.Collection(),
+			"partition_id":  s.Partition(),
+			"segment_id":    s.ID(),
+			"segment_type":  s.segmentType.String(),
+			"nq":            searchReq.getNumOfQuery(),
+		},
+	)
+	defer tracer.EndTrace(searchSpan)
+
 	if !s.ptrLock.RLockIf(state.IsNotReleased) {
 		// TODO: check if the segment is readable but not released. too many related logic need to be refactor.
 		return nil, merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
@@ -592,6 +610,23 @@ func (s *LocalSegment) Search(ctx context.Context, searchReq *SearchRequest) (*S
 }
 
 func (s *LocalSegment) Retrieve(ctx context.Context, plan *RetrievePlan) (*segcorepb.RetrieveResults, error) {
+	querySpan := tracer.GetGlobalTracer().StartSpan(
+		tracer.GetTraceIDFromContext(ctx),
+		"",
+		"Query",
+		"segment_query",
+		"querynode",
+		map[string]interface{}{
+			"source":        "querynode_cache",
+			"collection_id": s.Collection(),
+			"partition_id":  s.Partition(),
+			"segment_id":    s.ID(),
+			"segment_type":  s.segmentType.String(),
+			"msg_id":        plan.msgID,
+		},
+	)
+	defer tracer.EndTrace(querySpan)
+
 	if !s.ptrLock.RLockIf(state.IsNotReleased) {
 		// TODO: check if the segment is readable but not released. too many related logic need to be refactor.
 		return nil, merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
@@ -879,6 +914,11 @@ func (s *LocalSegment) LoadMultiFieldData(ctx context.Context) error {
 	loadInfo := s.loadInfo.Load()
 	rowCount := loadInfo.GetNumOfRows()
 	fields := loadInfo.GetBinlogPaths()
+	loadSpan := traceSegmentLoadStage(ctx, "load_multi_field_data", s, map[string]interface{}{
+		"field_count": len(fields),
+		"row_count":   rowCount,
+	})
+	defer tracer.EndTrace(loadSpan)
 
 	if !s.ptrLock.RLockIf(state.IsNotReleased) {
 		return merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
@@ -945,6 +985,18 @@ func (s *LocalSegment) LoadMultiFieldData(ctx context.Context) error {
 }
 
 func (s *LocalSegment) LoadFieldData(ctx context.Context, fieldID int64, rowCount int64, field *datapb.FieldBinlog, useMmap bool) error {
+	binlogCount := 0
+	if field != nil {
+		binlogCount = len(field.GetBinlogs())
+	}
+	loadSpan := traceSegmentLoadStage(ctx, "load_field_data", s, map[string]interface{}{
+		"field_id":     fieldID,
+		"row_count":    rowCount,
+		"binlog_count": binlogCount,
+		"use_mmap":     useMmap,
+	})
+	defer tracer.EndTrace(loadSpan)
+
 	if !s.ptrLock.RLockIf(state.IsNotReleased) {
 		return merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
 	}
@@ -1237,6 +1289,14 @@ func (s *LocalSegment) LoadDeltaData(ctx context.Context, deltaData *storage.Del
 }
 
 func (s *LocalSegment) LoadIndex(ctx context.Context, indexInfo *querypb.FieldIndexInfo, fieldType schemapb.DataType) error {
+	loadSpan := traceSegmentLoadStage(ctx, "load_index", s, map[string]interface{}{
+		"field_id":         indexInfo.GetFieldID(),
+		"index_id":         indexInfo.GetIndexID(),
+		"index_file_count": len(indexInfo.GetIndexFilePaths()),
+		"field_type":       fieldType.String(),
+	})
+	defer tracer.EndTrace(loadSpan)
+
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", s.Collection()),
 		zap.Int64("partitionID", s.Partition()),

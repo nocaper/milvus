@@ -300,15 +300,17 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 		return funcutil.SliceContain(existPartitions, segment.PartitionID)
 	})
 
+	sealedNum := lo.SumBy(sealed, func(item SnapshotItem) int { return len(item.Segments) })
+
 	// Record segment statistics
-	routeSpan.AddMetadata("sealed_count", len(sealed))
+	routeSpan.AddMetadata("sealed_count", sealedNum)
 	routeSpan.AddMetadata("growing_count", len(growing))
 	tracer.EndTrace(routeSpan)
 
 	// Record segment type counts
 	tracer.GetGlobalTracer().RecordEvent(traceID, "", "Search", "segment_stats", "querynode",
 		0, map[string]interface{}{
-			"sealed_segments":  len(sealed),
+			"sealed_segments":  sealedNum,
 			"growing_segments": len(growing),
 		})
 
@@ -463,6 +465,10 @@ func (sd *shardDelegator) Query(ctx context.Context, req *querypb.QueryRequest) 
 	}
 	defer sd.lifetime.Done()
 
+	// Initialize trace ID for query operation
+	traceID := tracer.GenerateTraceID()
+	ctx = tracer.SetTraceIDToContext(ctx, traceID)
+
 	if !funcutil.SliceContain(req.GetDmlChannels(), sd.vchannelName) {
 		log.Warn("delegator received query request not belongs to it",
 			zap.Strings("reqChannels", req.GetDmlChannels()),
@@ -489,6 +495,13 @@ func (sd *shardDelegator) Query(ctx context.Context, req *querypb.QueryRequest) 
 		fmt.Sprint(paramtable.GetNodeID()), metrics.QueryLabel).
 		Observe(float64(waitTr.ElapseSpan().Milliseconds()))
 
+	// Trace: route and pin segments
+	routeSpan := tracer.TraceQuery(ctx, "route", map[string]interface{}{
+		"collection_id": req.GetReq().GetCollectionID(),
+		"partitions":    partitions,
+	})
+	routeSpan.SetComponent("querynode")
+
 	sealed, growing, version, err := sd.distribution.PinReadableSegments(req.GetReq().GetPartitionIDs()...)
 	if err != nil {
 		log.Warn("delegator failed to query, current distribution is not serviceable")
@@ -504,6 +517,20 @@ func (sd *shardDelegator) Query(ctx context.Context, req *querypb.QueryRequest) 
 		})
 	}
 
+	sealedNum := lo.SumBy(sealed, func(item SnapshotItem) int { return len(item.Segments) })
+
+	// Record segment statistics
+	routeSpan.AddMetadata("sealed_count", sealedNum)
+	routeSpan.AddMetadata("growing_count", len(growing))
+	tracer.EndTrace(routeSpan)
+
+	// Record segment type counts
+	tracer.GetGlobalTracer().RecordEvent(traceID, "", "Query", "segment_stats", "querynode",
+		0, map[string]interface{}{
+			"sealed_segments":  sealedNum,
+			"growing_segments": len(growing),
+		})
+
 	if paramtable.Get().QueryNodeCfg.EnableSegmentPrune.GetAsBool() {
 		func() {
 			sd.partitionStatsMut.RLock()
@@ -512,7 +539,6 @@ func (sd *shardDelegator) Query(ctx context.Context, req *querypb.QueryRequest) 
 		}()
 	}
 
-	sealedNum := lo.SumBy(sealed, func(item SnapshotItem) int { return len(item.Segments) })
 	log.Debug("query segments...",
 		zap.Int("sealedNum", sealedNum),
 		zap.Int("growingNum", len(growing)),

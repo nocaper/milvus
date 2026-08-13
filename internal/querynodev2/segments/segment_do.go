@@ -8,10 +8,45 @@ import (
 
 	"github.com/milvus-io/milvus/internal/querynodev2/segments/metricsutil"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/tracer"
 	"github.com/milvus-io/milvus/pkg/util/conc"
 )
 
 type doOnSegmentFunc func(ctx context.Context, segment Segment) error
+type latencyTraceOperationKey struct{}
+
+func withLatencyTraceOperation(ctx context.Context, operation string) context.Context {
+	return context.WithValue(ctx, latencyTraceOperationKey{}, operation)
+}
+
+func getLatencyTraceOperation(ctx context.Context) string {
+	operation, _ := ctx.Value(latencyTraceOperationKey{}).(string)
+	return operation
+}
+
+func recordSegmentCacheAccess(ctx context.Context, operation string, segment Segment, hit bool) {
+	stage := "segment_cache_hit"
+	source := "querynode_cache"
+	if !hit {
+		stage = "segment_cache_miss"
+		source = "object_store"
+	}
+	tracer.GetGlobalTracer().RecordEvent(
+		tracer.GetTraceIDFromContext(ctx),
+		"",
+		operation,
+		stage,
+		"querynode",
+		0,
+		map[string]interface{}{
+			"source":        source,
+			"collection_id": segment.Collection(),
+			"partition_id":  segment.Partition(),
+			"segment_id":    segment.ID(),
+			"segment_type":  segment.Type().String(),
+		},
+	)
+}
 
 func doOnSegment(ctx context.Context, mgr *Manager, seg Segment, do doOnSegmentFunc) error {
 	// record search time and cache miss
@@ -25,10 +60,12 @@ func doOnSegment(ctx context.Context, mgr *Manager, seg Segment, do doOnSegmentF
 		defer cancel()
 
 		var missing bool
-		missing, err = mgr.DiskCache.Do(ctx, seg.ID(), do)
+		traceCtx := withLatencyTraceOperation(ctx, "Query")
+		missing, err = mgr.DiskCache.Do(traceCtx, seg.ID(), do)
 		if missing {
 			accessRecord.CacheMissing()
 		}
+		recordSegmentCacheAccess(traceCtx, "Query", seg, !missing)
 		if err != nil {
 			log.Ctx(ctx).Warn("failed to do query disk cache", zap.Int64("segID", seg.ID()), zap.Error(err))
 		}
