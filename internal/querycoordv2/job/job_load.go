@@ -35,6 +35,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/eventlog"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/tracer"
 	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
@@ -200,6 +201,21 @@ func (job *LoadCollectionJob) Execute() error {
 		CreatedAt: time.Now(),
 		LoadSpan:  sp,
 	}
+	querycoordSubmitSpan := tracer.GetGlobalTracer().StartSpan(
+		tracer.GetTraceIDFromContext(ctx),
+		"",
+		"LoadCollection",
+		"querycoord_submit",
+		"querycoord",
+		map[string]interface{}{
+			"collection_id":        req.GetCollectionID(),
+			"partition_count":      len(partitions),
+			"replica_number":       req.GetReplicaNumber(),
+			"resource_group_count": len(req.GetResourceGroups()),
+			"refresh":              req.GetRefresh(),
+		},
+	)
+	defer tracer.EndTrace(querycoordSubmitSpan)
 	job.undo.IsNewCollection = true
 	err = job.meta.CollectionManager.PutCollection(collection, partitions...)
 	if err != nil {
@@ -371,6 +387,21 @@ func (job *LoadPartitionJob) Execute() error {
 		}
 	})
 	ctx, sp := otel.Tracer(typeutil.QueryCoordRole).Start(job.ctx, "LoadPartition", trace.WithNewRoot())
+	querycoordSubmitSpan := tracer.GetGlobalTracer().StartSpan(
+		tracer.GetTraceIDFromContext(ctx),
+		"",
+		"LoadPartition",
+		"querycoord_submit",
+		"querycoord",
+		map[string]interface{}{
+			"collection_id":        req.GetCollectionID(),
+			"partition_count":      len(partitions),
+			"replica_number":       req.GetReplicaNumber(),
+			"resource_group_count": len(req.GetResourceGroups()),
+			"refresh":              req.GetRefresh(),
+		},
+	)
+	defer tracer.EndTrace(querycoordSubmitSpan)
 	if !job.meta.CollectionManager.Exist(req.GetCollectionID()) {
 		job.undo.IsNewCollection = true
 

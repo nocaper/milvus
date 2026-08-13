@@ -254,14 +254,27 @@ class LatencyAnalyzer:
 
     def analyze_load_operations(self) -> Dict:
         """Analyze LoadCollection/LoadPartition operations."""
-        load_latencies: List[float] = []
+        load_stages: Dict[str, List[float]] = defaultdict(list)
+        status_counts: Dict[str, int] = defaultdict(int)
 
-        for trace_id, events in self.traces_by_id.items():
-            if events[0].get('operation', '') not in ('LoadCollection', 'LoadPartition'):
+        for event in self.traces:
+            operation = event.get('operation', '')
+            if operation not in ('LoadCollection', 'LoadPartition'):
                 continue
-            load_latencies.append(sum(e.get('duration_ms', 0) for e in events))
+            stage = event.get('stage', '')
+            if stage not in ('querycoord_submit', 'load_start', 'load_complete', 'load_timeout', 'load_canceled'):
+                continue
+            load_stages[f'{operation}/{stage}'].append(event.get('duration_ms', 0))
+            if 'status' in event:
+                status_counts[f"{operation}/{stage}/{event.get('status')}"] += 1
 
-        return self._calc_stats(load_latencies)
+        return {
+            'stages': {
+                stage: self._calc_stats(durs)
+                for stage, durs in sorted(load_stages.items())
+            },
+            'status_counts': dict(sorted(status_counts.items())),
+        }
 
     def _trace_request_operations(self) -> Dict[str, str]:
         """Map trace IDs to the request operation that created them."""
@@ -271,6 +284,14 @@ class LatencyAnalyzer:
             stage = event.get('stage')
             if op in ('Search', 'Query') and stage in ('route', 'segment_stats', 'segment_search', 'segment_query'):
                 trace_ops[event.get('trace_id', '')] = op
+            elif op in ('LoadCollection', 'LoadPartition') and stage in (
+                'querycoord_submit',
+                'load_start',
+                'load_complete',
+                'load_timeout',
+                'load_canceled',
+            ):
+                trace_ops[event.get('trace_id', '')] = op
         return trace_ops
 
     def analyze_segment_loads(self) -> Dict:
@@ -278,6 +299,7 @@ class LatencyAnalyzer:
         total_load: List[float] = []
         cache_miss_load: List[float] = []
         load_substages: Dict[str, List[float]] = defaultdict(list)
+        total_load_by_operation: Dict[str, List[float]] = defaultdict(list)
         by_request_operation: Dict[str, List[float]] = defaultdict(list)
         trace_ops = self._trace_request_operations()
         substage_names = {
@@ -298,6 +320,8 @@ class LatencyAnalyzer:
             duration = event.get('duration_ms', 0)
             if stage == 'total_load':
                 total_load.append(duration)
+                trigger = trace_ops.get(event.get('trace_id', ''), 'Unknown')
+                total_load_by_operation[trigger].append(duration)
             elif stage == 'segment_cache_load':
                 cache_miss_load.append(duration)
                 trigger = str(event.get('trigger') or trace_ops.get(event.get('trace_id', ''), 'Unknown'))
@@ -311,6 +335,10 @@ class LatencyAnalyzer:
             'substages': {
                 stage: self._calc_stats(durs)
                 for stage, durs in sorted(load_substages.items())
+            },
+            'total_load_by_operation': {
+                op: self._calc_stats(durs)
+                for op, durs in sorted(total_load_by_operation.items())
             },
             'cache_miss_by_request_operation': {
                 op: self._calc_stats(durs)
@@ -348,7 +376,7 @@ class LatencyAnalyzer:
 
         print("\n### LOAD OPERATIONS ANALYSIS")
         print("-" * 80)
-        self._print_stats_dict(load_stats, "LoadCollection/LoadPartition")
+        self._print_load_operation_stats(load_stats)
 
         print("\n### SEGMENT LOAD ANALYSIS (OPTIMIZATION TARGET)")
         print("-" * 80)
@@ -439,11 +467,32 @@ class LatencyAnalyzer:
             if op_stats.get('count', 0) > 0:
                 self._print_stats_dict(op_stats, f"Cache-miss load during {operation}", indent="  ")
 
+        total_by_op = stats.get('total_load_by_operation', {})
+        for operation in ('LoadCollection', 'LoadPartition', 'Search', 'Query', 'Unknown'):
+            op_stats = total_by_op.get(operation, {})
+            if op_stats.get('count', 0) > 0:
+                self._print_stats_dict(op_stats, f"LoadSegment total load during {operation}", indent="  ")
+
         substages = stats.get('substages', {})
         if substages:
             print("\nLoad substages:")
             for stage, stage_stats in substages.items():
                 self._print_stats_dict(stage_stats, stage, indent="  ")
+
+    def _print_load_operation_stats(self, stats: Dict):
+        stages = stats.get('stages', {})
+        if not stages:
+            print("LoadCollection/LoadPartition: No data")
+            return
+
+        for name, data in stages.items():
+            self._print_stats_dict(data, name)
+
+        status_counts = stats.get('status_counts', {})
+        if status_counts:
+            print("\nLoad lifecycle event counts:")
+            for name, count in status_counts.items():
+                print(f"  {name}: {count}")
 
     def _print_cache_execution_stats(self, stats: Dict):
         stages = stats.get('stages', {})

@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/samber/lo"
-	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/internal/proto/querypb"
@@ -33,6 +32,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
 	"github.com/milvus-io/milvus/pkg/eventlog"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/tracer"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -56,6 +56,55 @@ type LoadTask struct {
 	LoadType     querypb.LoadType
 	CollectionID int64
 	PartitionIDs []int64
+	TraceID      string
+	StartedAt    time.Time
+}
+
+func newLoadTask(ctx context.Context, loadType querypb.LoadType, collectionID int64, partitionIDs []int64) LoadTask {
+	traceID := tracer.GetTraceIDFromContext(ctx)
+
+	return LoadTask{
+		LoadType:     loadType,
+		CollectionID: collectionID,
+		PartitionIDs: partitionIDs,
+		TraceID:      traceID,
+		StartedAt:    time.Now(),
+	}
+}
+
+func loadTaskOperation(task LoadTask) string {
+	switch task.LoadType {
+	case querypb.LoadType_LoadCollection:
+		return "LoadCollection"
+	case querypb.LoadType_LoadPartition:
+		return "LoadPartition"
+	default:
+		return "Load"
+	}
+}
+
+func loadTaskMetadata(task LoadTask, partitionCount int, status string) map[string]interface{} {
+	return map[string]interface{}{
+		"collection_id":   task.CollectionID,
+		"partition_count": partitionCount,
+		"load_type":       task.LoadType.String(),
+		"status":          status,
+	}
+}
+
+func recordLoadTaskEvent(task LoadTask, stage string, duration time.Duration, metadata map[string]interface{}) {
+	if task.TraceID == "" {
+		return
+	}
+	tracer.GetGlobalTracer().RecordEvent(
+		task.TraceID,
+		"",
+		loadTaskOperation(task),
+		stage,
+		"querycoord",
+		duration,
+		metadata,
+	)
 }
 
 func NewCollectionObserver(
@@ -118,29 +167,26 @@ func (ob *CollectionObserver) Stop() {
 }
 
 func (ob *CollectionObserver) LoadCollection(ctx context.Context, collectionID int64) {
-	span := trace.SpanFromContext(ctx)
-
-	traceID := span.SpanContext().TraceID()
-	key := traceID.String()
-
-	if !traceID.IsValid() {
+	task := newLoadTask(ctx, querypb.LoadType_LoadCollection, collectionID, nil)
+	key := task.TraceID
+	if key == "" {
 		key = fmt.Sprintf("LoadCollection_%d", collectionID)
 	}
 
-	ob.loadTasks.Insert(key, LoadTask{LoadType: querypb.LoadType_LoadCollection, CollectionID: collectionID})
+	ob.loadTasks.Insert(key, task)
+	recordLoadTaskEvent(task, "load_start", 0, loadTaskMetadata(task, len(ob.meta.GetPartitionsByCollection(collectionID)), "loading"))
 	ob.checkerController.Check()
 }
 
 func (ob *CollectionObserver) LoadPartitions(ctx context.Context, collectionID int64, partitionIDs []int64) {
-	span := trace.SpanFromContext(ctx)
-
-	traceID := span.SpanContext().TraceID()
-	key := traceID.String()
-	if !traceID.IsValid() {
+	task := newLoadTask(ctx, querypb.LoadType_LoadPartition, collectionID, partitionIDs)
+	key := task.TraceID
+	if key == "" {
 		key = fmt.Sprintf("LoadPartition_%d_%v", collectionID, partitionIDs)
 	}
 
-	ob.loadTasks.Insert(key, LoadTask{LoadType: querypb.LoadType_LoadPartition, CollectionID: collectionID, PartitionIDs: partitionIDs})
+	ob.loadTasks.Insert(key, task)
+	recordLoadTaskEvent(task, "load_start", 0, loadTaskMetadata(task, len(partitionIDs), "loading"))
 	ob.checkerController.Check()
 }
 
@@ -150,12 +196,13 @@ func (ob *CollectionObserver) Observe(ctx context.Context) {
 }
 
 func (ob *CollectionObserver) observeTimeout() {
-	ob.loadTasks.Range(func(traceID string, task LoadTask) bool {
+	ob.loadTasks.Range(func(taskKey string, task LoadTask) bool {
 		collection := ob.meta.CollectionManager.GetCollection(task.CollectionID)
 		// collection released
 		if collection == nil {
-			log.Info("Load Collection Task canceled, collection removed from meta", zap.Int64("collectionID", task.CollectionID), zap.String("traceID", traceID))
-			ob.loadTasks.Remove(traceID)
+			log.Info("Load Collection Task canceled, collection removed from meta", zap.Int64("collectionID", task.CollectionID), zap.String("traceID", taskKey))
+			recordLoadTaskEvent(task, "load_canceled", time.Since(task.StartedAt), loadTaskMetadata(task, len(task.PartitionIDs), "collection_removed"))
+			ob.loadTasks.Remove(taskKey)
 			return true
 		}
 
@@ -166,10 +213,11 @@ func (ob *CollectionObserver) observeTimeout() {
 				log.Info("load collection timeout, cancel it",
 					zap.Int64("collectionID", collection.GetCollectionID()),
 					zap.Duration("loadTime", time.Since(collection.CreatedAt)))
+				recordLoadTaskEvent(task, "load_timeout", time.Since(task.StartedAt), loadTaskMetadata(task, len(ob.meta.GetPartitionsByCollection(task.CollectionID)), "timeout"))
 				ob.meta.CollectionManager.RemoveCollection(collection.GetCollectionID())
 				ob.meta.ReplicaManager.RemoveCollection(collection.GetCollectionID())
 				ob.targetMgr.RemoveCollection(collection.GetCollectionID())
-				ob.loadTasks.Remove(traceID)
+				ob.loadTasks.Remove(taskKey)
 			}
 		case querypb.LoadType_LoadPartition:
 			partitionIDs := typeutil.NewSet(task.PartitionIDs...)
@@ -183,8 +231,9 @@ func (ob *CollectionObserver) observeTimeout() {
 				log.Info("Load Partitions Task canceled, collection removed from meta",
 					zap.Int64("collectionID", task.CollectionID),
 					zap.Int64s("partitionIDs", task.PartitionIDs),
-					zap.String("traceID", traceID))
-				ob.loadTasks.Remove(traceID)
+					zap.String("traceID", taskKey))
+				recordLoadTaskEvent(task, "load_canceled", time.Since(task.StartedAt), loadTaskMetadata(task, len(task.PartitionIDs), "partitions_removed"))
+				ob.loadTasks.Remove(taskKey)
 				return true
 			}
 
@@ -200,6 +249,7 @@ func (ob *CollectionObserver) observeTimeout() {
 				log.Info("load partitions timeout, cancel it",
 					zap.Int64("collectionID", task.CollectionID),
 					zap.Int64s("partitionIDs", task.PartitionIDs))
+				recordLoadTaskEvent(task, "load_timeout", time.Since(task.StartedAt), loadTaskMetadata(task, len(partitions), "timeout"))
 				for _, partition := range partitions {
 					ob.meta.CollectionManager.RemovePartition(partition.CollectionID, partition.GetPartitionID())
 					ob.targetMgr.RemovePartition(partition.GetCollectionID(), partition.GetPartitionID())
@@ -228,7 +278,7 @@ func (ob *CollectionObserver) readyToObserve(collectionID int64) bool {
 
 func (ob *CollectionObserver) observeLoadStatus(ctx context.Context) {
 	loading := false
-	ob.loadTasks.Range(func(traceID string, task LoadTask) bool {
+	ob.loadTasks.Range(func(taskKey string, task LoadTask) bool {
 		loading = true
 
 		collection := ob.meta.CollectionManager.GetCollection(task.CollectionID)
@@ -265,11 +315,12 @@ func (ob *CollectionObserver) observeLoadStatus(ctx context.Context) {
 		// all partition loaded, finish task
 		if len(partitions) > 0 && loaded {
 			log.Info("Load task finish",
-				zap.String("traceID", traceID),
+				zap.String("traceID", taskKey),
 				zap.Int64("collectionID", task.CollectionID),
 				zap.Int64s("partitionIDs", task.PartitionIDs),
 				zap.Stringer("loadType", task.LoadType))
-			ob.loadTasks.Remove(traceID)
+			recordLoadTaskEvent(task, "load_complete", time.Since(task.StartedAt), loadTaskMetadata(task, len(partitions), "loaded"))
+			ob.loadTasks.Remove(taskKey)
 		}
 
 		return true

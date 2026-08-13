@@ -85,6 +85,7 @@ type SearchRequest struct {
 	msgID             UniqueID
 	searchFieldID     UniqueID
 	mvccTimestamp     Timestamp
+	nq                int64
 }
 
 func NewSearchRequest(ctx context.Context, collection *Collection, req *querypb.SearchRequest, placeholderGrp []byte) (*SearchRequest, error) {
@@ -129,14 +130,17 @@ func NewSearchRequest(ctx context.Context, collection *Collection, req *querypb.
 		msgID:             req.GetReq().GetBase().GetMsgID(),
 		searchFieldID:     int64(fieldID),
 		mvccTimestamp:     req.GetReq().GetMvccTimestamp(),
+		nq:                req.GetReq().GetNq(),
 	}
 
 	return ret, nil
 }
 
 func (req *SearchRequest) getNumOfQuery() int64 {
-	numQueries := C.GetNumOfQueries(req.cPlaceholderGroup)
-	return int64(numQueries)
+	if req.nq <= 0 {
+		return 1
+	}
+	return req.nq
 }
 
 func (req *SearchRequest) Plan() *SearchPlan {
@@ -163,7 +167,11 @@ func parseSearchRequest(ctx context.Context, plan *SearchPlan, searchRequestBlob
 		return nil, err
 	}
 
-	ret := &SearchRequest{cPlaceholderGroup: cPlaceholderGroup, plan: plan}
+	ret := &SearchRequest{
+		cPlaceholderGroup: cPlaceholderGroup,
+		plan:              plan,
+		nq:                int64(C.GetNumOfQueries(cPlaceholderGroup)),
+	}
 	return ret, nil
 }
 
