@@ -2,6 +2,7 @@ package segments
 
 import (
 	"context"
+	"time"
 
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -22,6 +23,35 @@ func withLatencyTraceOperation(ctx context.Context, operation string) context.Co
 func getLatencyTraceOperation(ctx context.Context) string {
 	operation, _ := ctx.Value(latencyTraceOperationKey{}).(string)
 	return operation
+}
+
+func recordSegmentCacheWait(ctx context.Context, operation string, segment Segment, duration time.Duration, missing bool, err error) {
+	source := "querynode_cache"
+	if missing {
+		source = "object_store"
+	}
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+	tracer.GetGlobalTracer().RecordEvent(
+		tracer.GetTraceIDFromContext(ctx),
+		"",
+		operation,
+		"segment_cache_wait",
+		"querynode",
+		duration,
+		map[string]interface{}{
+			"source":        source,
+			"collection_id": segment.Collection(),
+			"partition_id":  segment.Partition(),
+			"segment_id":    segment.ID(),
+			"segment_type":  segment.Type().String(),
+			"cache_miss":    missing,
+			"cache_hit":     !missing,
+			"status":        status,
+		},
+	)
 }
 
 func recordSegmentCacheAccess(ctx context.Context, operation string, segment Segment, hit bool) {
@@ -61,7 +91,18 @@ func doOnSegment(ctx context.Context, mgr *Manager, seg Segment, do doOnSegmentF
 
 		var missing bool
 		traceCtx := withLatencyTraceOperation(ctx, "Query")
-		missing, err = mgr.DiskCache.Do(traceCtx, seg.ID(), do)
+		cacheWaitStart := time.Now()
+		cacheWaitDuration := time.Duration(0)
+		doStarted := false
+		missing, err = mgr.DiskCache.Do(traceCtx, seg.ID(), func(ctx context.Context, segment Segment) error {
+			cacheWaitDuration = time.Since(cacheWaitStart)
+			doStarted = true
+			return do(ctx, segment)
+		})
+		if !doStarted {
+			cacheWaitDuration = time.Since(cacheWaitStart)
+		}
+		recordSegmentCacheWait(traceCtx, "Query", seg, cacheWaitDuration, missing, err)
 		if missing {
 			accessRecord.CacheMissing()
 		}

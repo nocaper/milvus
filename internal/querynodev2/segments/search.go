@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -84,7 +85,18 @@ func searchSegments(ctx context.Context, mgr *Manager, segments []Segment, segTy
 
 				var missing bool
 				traceCtx := withLatencyTraceOperation(ctx, "Search")
-				missing, err = mgr.DiskCache.Do(traceCtx, seg.ID(), searcher)
+				cacheWaitStart := time.Now()
+				cacheWaitDuration := time.Duration(0)
+				doStarted := false
+				missing, err = mgr.DiskCache.Do(traceCtx, seg.ID(), func(ctx context.Context, segment Segment) error {
+					cacheWaitDuration = time.Since(cacheWaitStart)
+					doStarted = true
+					return searcher(ctx, segment)
+				})
+				if !doStarted {
+					cacheWaitDuration = time.Since(cacheWaitStart)
+				}
+				recordSegmentCacheWait(traceCtx, "Search", seg, cacheWaitDuration, missing, err)
 				if missing {
 					accessRecord.CacheMissing()
 				}
@@ -176,7 +188,18 @@ func searchSegmentsStreamly(ctx context.Context,
 
 				var missing bool
 				traceCtx := withLatencyTraceOperation(ctx, "Search")
-				missing, err = mgr.DiskCache.Do(traceCtx, seg.ID(), searcher)
+				cacheWaitStart := time.Now()
+				cacheWaitDuration := time.Duration(0)
+				doStarted := false
+				missing, err = mgr.DiskCache.Do(traceCtx, seg.ID(), func(ctx context.Context, segment Segment) error {
+					cacheWaitDuration = time.Since(cacheWaitStart)
+					doStarted = true
+					return searcher(ctx, segment)
+				})
+				if !doStarted {
+					cacheWaitDuration = time.Since(cacheWaitStart)
+				}
+				recordSegmentCacheWait(traceCtx, "Search", seg, cacheWaitDuration, missing, err)
 				if missing {
 					accessRecord.CacheMissing()
 				}

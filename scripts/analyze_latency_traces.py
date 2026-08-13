@@ -163,6 +163,16 @@ class LatencyAnalyzer:
         segment_counts_by_trace: Dict[str, dict] = defaultdict(dict)
         cache_hits_by_operation: Dict[str, int] = defaultdict(int)
         cache_misses_by_operation: Dict[str, int] = defaultdict(int)
+        cache_wait_latency: Dict[str, List[float]] = defaultdict(list)
+        cache_wait_by_result: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+        cache_wait_by_trace: Dict[str, dict] = defaultdict(lambda: {
+            'operation': 'Unknown',
+            'durations': [],
+            'segments': set(),
+            'miss_waits': [],
+            'hit_waits': [],
+            'error_waits': [],
+        })
         segment_stats_without_counts = 0
 
         for event in self.traces:
@@ -189,6 +199,28 @@ class LatencyAnalyzer:
                 cache_hits_by_operation[operation] += 1
             elif stage == 'segment_cache_miss':
                 cache_misses_by_operation[operation] += 1
+            elif stage == 'segment_cache_wait':
+                trace_ids_by_operation[operation].add(trace_id)
+                duration = event.get('duration_ms', 0)
+                status = str(event.get('status', 'ok'))
+                cache_miss = self._is_truthy(event.get('cache_miss'))
+                result = 'cache_miss' if cache_miss else 'cache_hit'
+                if status != 'ok':
+                    result = 'error'
+                cache_wait_latency[operation].append(duration)
+                cache_wait_by_result[operation][result].append(duration)
+
+                request = cache_wait_by_trace[trace_id]
+                request['operation'] = operation
+                request['durations'].append(duration)
+                if 'segment_id' in event:
+                    request['segments'].add(event.get('segment_id'))
+                if result == 'cache_miss':
+                    request['miss_waits'].append(duration)
+                elif result == 'cache_hit':
+                    request['hit_waits'].append(duration)
+                else:
+                    request['error_waits'].append(duration)
 
         growing_hits = 0
         sealed_hits = 0
@@ -217,12 +249,80 @@ class LatencyAnalyzer:
             'route_count_fallbacks': route_count_fallbacks,
             'cache_hits_by_operation': dict(cache_hits_by_operation),
             'cache_misses_by_operation': dict(cache_misses_by_operation),
+            'cache_wait_latency': {
+                op: self._calc_stats(durs)
+                for op, durs in sorted(cache_wait_latency.items())
+            },
+            'cache_wait_by_result': {
+                op: {
+                    result: self._calc_stats(durs)
+                    for result, durs in sorted(results.items())
+                }
+                for op, results in sorted(cache_wait_by_result.items())
+            },
+            'cache_wait_request_overhead': self._build_cache_wait_request_overhead(cache_wait_by_trace),
             'route_latency': {
                 op: self._calc_stats(durs)
                 for op, durs in route_latency.items()
             },
         }
         return stats
+
+    def _build_cache_wait_request_overhead(self, cache_wait_by_trace: Dict[str, dict]) -> Dict:
+        """Summarize request-visible lazy-load cache wait from per-segment wait events."""
+        grouped: Dict[str, dict] = defaultdict(lambda: {
+            'per_request_max_wait': [],
+            'per_request_sum_wait': [],
+            'segments_per_request': [],
+            'requests_with_miss_wait': 0,
+            'requests_with_hit_wait': 0,
+            'requests_with_error_wait': 0,
+            'requests_wait_gt_1ms': 0,
+            'requests_wait_gt_10ms': 0,
+            'requests_wait_gt_100ms': 0,
+            'requests_wait_gt_1000ms': 0,
+        })
+
+        for request in cache_wait_by_trace.values():
+            durations = request.get('durations', [])
+            if not durations:
+                continue
+            operation = request.get('operation', 'Unknown')
+            max_wait = max(durations)
+            grouped[operation]['per_request_max_wait'].append(max_wait)
+            grouped[operation]['per_request_sum_wait'].append(sum(durations))
+            grouped[operation]['segments_per_request'].append(len(request.get('segments', set())) or len(durations))
+            if request.get('miss_waits'):
+                grouped[operation]['requests_with_miss_wait'] += 1
+            if request.get('hit_waits'):
+                grouped[operation]['requests_with_hit_wait'] += 1
+            if request.get('error_waits'):
+                grouped[operation]['requests_with_error_wait'] += 1
+            if max_wait > 1:
+                grouped[operation]['requests_wait_gt_1ms'] += 1
+            if max_wait > 10:
+                grouped[operation]['requests_wait_gt_10ms'] += 1
+            if max_wait > 100:
+                grouped[operation]['requests_wait_gt_100ms'] += 1
+            if max_wait > 1000:
+                grouped[operation]['requests_wait_gt_1000ms'] += 1
+
+        return {
+            operation: {
+                'requests_with_cache_wait': len(data['per_request_max_wait']),
+                'requests_with_miss_wait': data['requests_with_miss_wait'],
+                'requests_with_hit_wait': data['requests_with_hit_wait'],
+                'requests_with_error_wait': data['requests_with_error_wait'],
+                'requests_wait_gt_1ms': data['requests_wait_gt_1ms'],
+                'requests_wait_gt_10ms': data['requests_wait_gt_10ms'],
+                'requests_wait_gt_100ms': data['requests_wait_gt_100ms'],
+                'requests_wait_gt_1000ms': data['requests_wait_gt_1000ms'],
+                'segments_per_request': self._calc_stats(data['segments_per_request']),
+                'per_request_max_wait': self._calc_stats(data['per_request_max_wait']),
+                'per_request_sum_wait': self._calc_stats(data['per_request_sum_wait']),
+            }
+            for operation, data in sorted(grouped.items())
+        }
 
     def analyze_querynode_cache_execution(self) -> Dict:
         """Analyze per-segment execution once data is already in QueryNode memory/cache."""
@@ -301,6 +401,12 @@ class LatencyAnalyzer:
         load_substages: Dict[str, List[float]] = defaultdict(list)
         total_load_by_operation: Dict[str, List[float]] = defaultdict(list)
         by_request_operation: Dict[str, List[float]] = defaultdict(list)
+        request_cache_loads: Dict[str, dict] = defaultdict(lambda: {
+            'operation': 'Unknown',
+            'durations': [],
+            'segments': set(),
+        })
+        file_breakdown_events: Dict[str, List[dict]] = defaultdict(list)
         trace_ops = self._trace_request_operations()
         substage_names = {
             'load_index',
@@ -326,8 +432,41 @@ class LatencyAnalyzer:
                 cache_miss_load.append(duration)
                 trigger = str(event.get('trigger') or trace_ops.get(event.get('trace_id', ''), 'Unknown'))
                 by_request_operation[trigger].append(duration)
+                trace_id = event.get('trace_id', '')
+                request_cache_loads[trace_id]['operation'] = trigger
+                request_cache_loads[trace_id]['durations'].append(duration)
+                if 'segment_id' in event:
+                    request_cache_loads[trace_id]['segments'].add(event.get('segment_id'))
             elif stage in substage_names:
                 load_substages[stage].append(duration)
+                file_breakdown_events[stage].append(event)
+
+        request_s3_overhead: Dict[str, dict] = {}
+        request_groups: Dict[str, dict] = defaultdict(lambda: {
+            'request_sum_work': [],
+            'request_max_wait': [],
+            'segments_per_request': [],
+        })
+        for request in request_cache_loads.values():
+            durations = request['durations']
+            if not durations:
+                continue
+            operation = request.get('operation', 'Unknown')
+            request_groups[operation]['request_sum_work'].append(sum(durations))
+            request_groups[operation]['request_max_wait'].append(max(durations))
+            request_groups[operation]['segments_per_request'].append(len(request.get('segments', set())) or len(durations))
+
+        for operation, data in sorted(request_groups.items()):
+            sum_work = data['request_sum_work']
+            max_wait = data['request_max_wait']
+            request_s3_overhead[operation] = {
+                'affected_requests': len(sum_work),
+                'request_sum_work': self._calc_stats(sum_work),
+                'request_max_wait': self._calc_stats(max_wait),
+                'segments_per_request': self._calc_stats(data['segments_per_request']),
+                'total_s3_work_ms': sum(sum_work),
+                'total_estimated_request_wait_ms': sum(max_wait),
+            }
 
         return {
             'total_load': self._calc_stats(total_load),
@@ -344,7 +483,80 @@ class LatencyAnalyzer:
                 op: self._calc_stats(durs)
                 for op, durs in sorted(by_request_operation.items())
             },
+            'request_s3_overhead': request_s3_overhead,
+            'file_breakdown': self._build_file_breakdown(file_breakdown_events),
         }
+
+    def _build_file_breakdown(self, events_by_stage: Dict[str, List[dict]]) -> Dict:
+        """Summarize file/binlog-oriented metadata for LoadSegment substages."""
+        breakdown: Dict[str, dict] = {}
+        for stage, events in sorted(events_by_stage.items()):
+            by_segment: Dict[str, dict] = defaultdict(lambda: {
+                'event_count': 0,
+                'total_duration_ms': 0.0,
+                'fields': set(),
+                'indexes': set(),
+                'binlog_count': 0,
+                'index_file_count': 0,
+                'blob_count': 0,
+                'field_binlog_count': 0,
+            })
+
+            total_binlogs = 0
+            total_index_files = 0
+            total_blobs = 0
+            total_field_binlogs = 0
+            for event in events:
+                segment_id = str(event.get('segment_id', 'unknown'))
+                segment = by_segment[segment_id]
+                segment['event_count'] += 1
+                segment['total_duration_ms'] += event.get('duration_ms', 0)
+
+                if 'field_id' in event:
+                    segment['fields'].add(event.get('field_id'))
+                if 'index_id' in event:
+                    segment['indexes'].add(event.get('index_id'))
+
+                binlog_count = int(event.get('binlog_count', 0) or 0)
+                index_file_count = int(event.get('index_file_count', 0) or 0)
+                blob_count = int(event.get('blob_count', 0) or 0)
+                field_binlog_count = int(event.get('field_binlog_count', 0) or 0)
+
+                segment['binlog_count'] += binlog_count
+                segment['index_file_count'] += index_file_count
+                segment['blob_count'] += blob_count
+                segment['field_binlog_count'] += field_binlog_count
+
+                total_binlogs += binlog_count
+                total_index_files += index_file_count
+                total_blobs += blob_count
+                total_field_binlogs += field_binlog_count
+
+            segment_rows = []
+            for segment_id, segment in by_segment.items():
+                segment_rows.append({
+                    'segment_id': segment_id,
+                    'event_count': segment['event_count'],
+                    'total_duration_ms': segment['total_duration_ms'],
+                    'field_count': len(segment['fields']),
+                    'index_count': len(segment['indexes']),
+                    'binlog_count': segment['binlog_count'],
+                    'index_file_count': segment['index_file_count'],
+                    'blob_count': segment['blob_count'],
+                    'field_binlog_count': segment['field_binlog_count'],
+                })
+            segment_rows.sort(key=lambda row: row['total_duration_ms'], reverse=True)
+
+            breakdown[stage] = {
+                'event_count': len(events),
+                'segment_count': len(by_segment),
+                'total_binlog_count': total_binlogs,
+                'total_index_file_count': total_index_files,
+                'total_blob_count': total_blobs,
+                'total_field_binlog_count': total_field_binlogs,
+                'top_segments': segment_rows[:5],
+            }
+        return breakdown
 
     # ------------------------------------------------------------------
     # Report generation
@@ -437,7 +649,7 @@ class LatencyAnalyzer:
             hits = stats.get('cache_hits_by_operation', {}).get(operation, 0)
             misses = stats.get('cache_misses_by_operation', {}).get(operation, 0)
             if hits or misses:
-                print(f"{operation} QueryNode cache hits/misses: {hits} / {misses}")
+                print(f"{operation} lazy DiskCache hit/miss events: {hits} / {misses}")
         if stats.get('segment_stats_without_counts', 0):
             print(
                 f"Segment stats without counts: {stats['segment_stats_without_counts']} "
@@ -450,6 +662,66 @@ class LatencyAnalyzer:
             and not stats.get('cache_misses_by_operation')
         ):
             print("Lazy-load disk cache hits/misses: No data")
+
+        cache_wait_latency = stats.get('cache_wait_latency', {})
+        cache_wait_by_result = stats.get('cache_wait_by_result', {})
+        request_overhead = stats.get('cache_wait_request_overhead', {})
+        if cache_wait_latency:
+            print("\nLazy-load cache wait before segment execution:")
+            for operation in ('Search', 'Query'):
+                op_stats = cache_wait_latency.get(operation, {})
+                if op_stats.get('count', 0) <= 0:
+                    continue
+                self._print_stats_dict(op_stats, f"{operation} segment_cache_wait", indent="  ")
+
+                by_result = cache_wait_by_result.get(operation, {})
+                for result in ('cache_miss', 'cache_hit', 'error'):
+                    result_stats = by_result.get(result, {})
+                    if result_stats.get('count', 0) > 0:
+                        label = result
+                        if result == 'cache_miss':
+                            label = 'physical cache-miss loader'
+                        elif result == 'cache_hit':
+                            label = 'non-loader lazy access'
+                        self._print_stats_dict(result_stats, f"{operation} wait on {label}", indent="    ")
+
+                req_stats = request_overhead.get(operation, {})
+                if req_stats:
+                    total_requests = stats.get('search_requests' if operation == 'Search' else 'query_requests', 0)
+                    print(
+                        f"  {operation} requests with lazy segment access: "
+                        f"{self._format_count_pct(req_stats.get('requests_with_cache_wait', 0), total_requests)}"
+                    )
+                    print(
+                        f"  {operation} requests that performed the physical miss load: "
+                        f"{self._format_count_pct(req_stats.get('requests_with_miss_wait', 0), total_requests)}"
+                    )
+                    print(
+                        f"  {operation} requests with non-loader lazy access: "
+                        f"{self._format_count_pct(req_stats.get('requests_with_hit_wait', 0), total_requests)}"
+                    )
+                    print(
+                        f"  {operation} requests with max cache wait > 10ms: "
+                        f"{self._format_count_pct(req_stats.get('requests_wait_gt_10ms', 0), total_requests)}"
+                    )
+                    print(
+                        f"  {operation} requests with max cache wait > 100ms: "
+                        f"{self._format_count_pct(req_stats.get('requests_wait_gt_100ms', 0), total_requests)}"
+                    )
+                    print(
+                        f"  {operation} requests with max cache wait > 1000ms: "
+                        f"{self._format_count_pct(req_stats.get('requests_wait_gt_1000ms', 0), total_requests)}"
+                    )
+                    self._print_stats_dict(
+                        req_stats.get('per_request_max_wait', {}),
+                        f"{operation} per-request max cache wait",
+                        indent="    ",
+                    )
+                    self._print_stats_dict(
+                        req_stats.get('per_request_sum_wait', {}),
+                        f"{operation} per-request sum cache wait",
+                        indent="    ",
+                    )
         route_latency = stats.get('route_latency', {})
         for operation in ('Search', 'Query'):
             op_stats = route_latency.get(operation, {})
@@ -473,11 +745,80 @@ class LatencyAnalyzer:
             if op_stats.get('count', 0) > 0:
                 self._print_stats_dict(op_stats, f"LoadSegment total load during {operation}", indent="  ")
 
+        request_overhead = stats.get('request_s3_overhead', {})
+        if request_overhead:
+            print("\nPhysical S3/object-store load grouped by initiating request:")
+            for operation in ('Search', 'Query', 'Unknown'):
+                op_stats = request_overhead.get(operation)
+                if not op_stats:
+                    continue
+                print(f"  {operation}:")
+                print(f"    Requests that performed physical load: {op_stats.get('affected_requests', 0)}")
+                print(f"    Total physical S3 load work: {op_stats.get('total_s3_work_ms', 0):.2f} ms")
+                print(
+                    "    Estimated initiating-request wait: "
+                    f"{op_stats.get('total_estimated_request_wait_ms', 0):.2f} ms "
+                    "(sum of per-request max segment load)"
+                )
+                self._print_stats_dict(
+                    op_stats.get('segments_per_request', {}),
+                    "Segments physically loaded per initiating request",
+                    indent="    ",
+                )
+                self._print_stats_dict(
+                    op_stats.get('request_sum_work', {}),
+                    "Per-request S3 load work, sum of segments",
+                    indent="    ",
+                )
+                self._print_stats_dict(
+                    op_stats.get('request_max_wait', {}),
+                    "Per-initiating-request estimated wait, max segment load",
+                    indent="    ",
+                )
+
         substages = stats.get('substages', {})
         if substages:
             print("\nLoad substages:")
             for stage, stage_stats in substages.items():
                 self._print_stats_dict(stage_stats, stage, indent="  ")
+
+        file_breakdown = stats.get('file_breakdown', {})
+        if file_breakdown:
+            print("\nLoad file/binlog breakdown:")
+            for stage, stage_stats in file_breakdown.items():
+                print(f"  {stage}:")
+                print(f"    Events:   {stage_stats.get('event_count', 0)}")
+                print(f"    Segments: {stage_stats.get('segment_count', 0)}")
+                if stage_stats.get('total_binlog_count', 0):
+                    print(f"    Total binlogs: {stage_stats['total_binlog_count']}")
+                if stage_stats.get('total_index_file_count', 0):
+                    print(f"    Total index files: {stage_stats['total_index_file_count']}")
+                if stage_stats.get('total_blob_count', 0):
+                    print(f"    Total blobs: {stage_stats['total_blob_count']}")
+                if stage_stats.get('total_field_binlog_count', 0):
+                    print(f"    Total field binlogs: {stage_stats['total_field_binlog_count']}")
+                top_segments = stage_stats.get('top_segments', [])
+                if top_segments:
+                    print("    Top segments by substage duration:")
+                    for segment in top_segments:
+                        details = [
+                            f"segment={segment['segment_id']}",
+                            f"events={segment['event_count']}",
+                            f"total_ms={segment['total_duration_ms']:.2f}",
+                        ]
+                        if segment.get('field_count'):
+                            details.append(f"fields={segment['field_count']}")
+                        if segment.get('index_count'):
+                            details.append(f"indexes={segment['index_count']}")
+                        if segment.get('binlog_count'):
+                            details.append(f"binlogs={segment['binlog_count']}")
+                        if segment.get('index_file_count'):
+                            details.append(f"index_files={segment['index_file_count']}")
+                        if segment.get('blob_count'):
+                            details.append(f"blobs={segment['blob_count']}")
+                        if segment.get('field_binlog_count'):
+                            details.append(f"field_binlogs={segment['field_binlog_count']}")
+                        print(f"      - {', '.join(details)}")
 
     def _print_load_operation_stats(self, stats: Dict):
         stages = stats.get('stages', {})
@@ -533,6 +874,21 @@ class LatencyAnalyzer:
             print(f"   - Mean latency: {cache_miss_load['mean']:.2f} ms")
             print(f"   - P95 latency:  {cache_miss_load['p95']:.2f} ms")
             print("   - This is the cold path most directly affected by avoiding object-store reads.")
+            request_overhead = seg_stats.get('request_s3_overhead', {})
+            for operation in ('Search', 'Query'):
+                op_stats = request_overhead.get(operation)
+                if not op_stats:
+                    continue
+                max_wait = op_stats.get('request_max_wait', {})
+                if max_wait.get('count', 0) > 0:
+                    print(
+                        f"   - {operation} requests that performed physical S3 load: "
+                        f"{op_stats.get('affected_requests', 0)}"
+                    )
+                    print(
+                        f"   - Initiating {operation} wait mean/P95: "
+                        f"{max_wait.get('mean', 0):.2f} / {max_wait.get('p95', 0):.2f} ms"
+                    )
         elif total_load.get('count', 0) > 0:
             print("\n1. SEGMENT LOAD FROM OBJECT STORE:")
             print(f"   - {total_load['count']} segment loads observed outside a traced query/search request")
@@ -556,6 +912,27 @@ class LatencyAnalyzer:
             print(f"   - Query requests:       {search_stats.get('query_requests', 0)}")
             print(f"   - Growing segment hits: {search_stats.get('growing_segment_hits', 0)}")
             print(f"   - Sealed segment hits:  {search_stats.get('sealed_segment_hits', 0)}")
+            cache_wait_overhead = search_stats.get('cache_wait_request_overhead', {})
+            for operation in ('Search', 'Query'):
+                op_stats = cache_wait_overhead.get(operation)
+                if not op_stats:
+                    continue
+                max_wait = op_stats.get('per_request_max_wait', {})
+                if max_wait.get('count', 0) > 0:
+                    total_op_requests = search_stats.get('search_requests' if operation == 'Search' else 'query_requests', 0)
+                    print(
+                        f"   - {operation} requests with lazy segment cache wait: "
+                        f"{self._format_count_pct(op_stats.get('requests_with_cache_wait', 0), total_op_requests)}"
+                    )
+                    print(
+                        f"   - {operation} requests with cache wait >100ms/>1000ms: "
+                        f"{self._format_count_pct(op_stats.get('requests_wait_gt_100ms', 0), total_op_requests)} / "
+                        f"{self._format_count_pct(op_stats.get('requests_wait_gt_1000ms', 0), total_op_requests)}"
+                    )
+                    print(
+                        f"   - {operation} request max cache wait mean/P95: "
+                        f"{max_wait.get('mean', 0):.2f} / {max_wait.get('p95', 0):.2f} ms"
+                    )
 
         if hot_search.get('count', 0) > 0 or hot_query.get('count', 0) > 0:
             print("\n4. QUERYNODE CACHE EXECUTION:")
@@ -650,6 +1027,22 @@ class LatencyAnalyzer:
             plt.tight_layout()
             plt.savefig(output_path / 'segment_type_distribution.png', dpi=300)
             plt.close()
+
+    @staticmethod
+    def _format_count_pct(count: int, total: int) -> str:
+        if total <= 0:
+            return str(count)
+        return f"{count} / {total} ({(count / total) * 100:.2f}%)"
+
+    @staticmethod
+    def _is_truthy(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.lower() in ('true', '1', 'yes', 'y')
+        return False
 
     @staticmethod
     def _percentile(data: List[float], pct: float) -> float:
