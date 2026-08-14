@@ -24,17 +24,32 @@ import sys
 import argparse
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import statistics
 
-# Optional visualization dependencies
+# Optional export/visualization dependencies
 try:
     import pandas as pd
+    HAS_CSV_DEPS = True
+except ImportError:
+    pd = None
+    HAS_CSV_DEPS = False
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    import seaborn as sns
     HAS_PLOT_DEPS = True
 except ImportError:
+    plt = None
     HAS_PLOT_DEPS = False
+
+try:
+    import seaborn as sns
+    HAS_SEABORN = True
+except ImportError:
+    sns = None
+    HAS_SEABORN = False
 
 # Matches lines like:
 #   [LATENCY_TRACE] trace_id=abc operation=Insert stage=serialize component=proxy duration_ms=1.23
@@ -273,6 +288,10 @@ class LatencyAnalyzer:
         grouped: Dict[str, dict] = defaultdict(lambda: {
             'per_request_max_wait': [],
             'per_request_sum_wait': [],
+            'per_request_miss_max_wait': [],
+            'per_request_miss_sum_wait': [],
+            'per_request_hit_max_wait': [],
+            'per_request_hit_sum_wait': [],
             'segments_per_request': [],
             'requests_with_miss_wait': 0,
             'requests_with_hit_wait': 0,
@@ -281,6 +300,16 @@ class LatencyAnalyzer:
             'requests_wait_gt_10ms': 0,
             'requests_wait_gt_100ms': 0,
             'requests_wait_gt_1000ms': 0,
+            'requests_miss_wait_gt_1ms': 0,
+            'requests_miss_wait_gt_10ms': 0,
+            'requests_miss_wait_gt_100ms': 0,
+            'requests_miss_wait_gt_1000ms': 0,
+            'requests_hit_wait_gt_1ms': 0,
+            'requests_hit_wait_gt_10ms': 0,
+            'requests_hit_wait_gt_100ms': 0,
+            'requests_hit_wait_gt_1000ms': 0,
+            'non_loader_waits': [],
+            'physical_loader_waits': [],
         })
 
         for request in cache_wait_by_trace.values():
@@ -292,6 +321,35 @@ class LatencyAnalyzer:
             grouped[operation]['per_request_max_wait'].append(max_wait)
             grouped[operation]['per_request_sum_wait'].append(sum(durations))
             grouped[operation]['segments_per_request'].append(len(request.get('segments', set())) or len(durations))
+
+            hit_waits = request.get('hit_waits', [])
+            miss_waits = request.get('miss_waits', [])
+            if hit_waits:
+                hit_max_wait = max(hit_waits)
+                grouped[operation]['per_request_hit_max_wait'].append(hit_max_wait)
+                grouped[operation]['per_request_hit_sum_wait'].append(sum(hit_waits))
+                grouped[operation]['non_loader_waits'].extend(hit_waits)
+                if hit_max_wait > 1:
+                    grouped[operation]['requests_hit_wait_gt_1ms'] += 1
+                if hit_max_wait > 10:
+                    grouped[operation]['requests_hit_wait_gt_10ms'] += 1
+                if hit_max_wait > 100:
+                    grouped[operation]['requests_hit_wait_gt_100ms'] += 1
+                if hit_max_wait > 1000:
+                    grouped[operation]['requests_hit_wait_gt_1000ms'] += 1
+            if miss_waits:
+                miss_max_wait = max(miss_waits)
+                grouped[operation]['per_request_miss_max_wait'].append(miss_max_wait)
+                grouped[operation]['per_request_miss_sum_wait'].append(sum(miss_waits))
+                grouped[operation]['physical_loader_waits'].extend(miss_waits)
+                if miss_max_wait > 1:
+                    grouped[operation]['requests_miss_wait_gt_1ms'] += 1
+                if miss_max_wait > 10:
+                    grouped[operation]['requests_miss_wait_gt_10ms'] += 1
+                if miss_max_wait > 100:
+                    grouped[operation]['requests_miss_wait_gt_100ms'] += 1
+                if miss_max_wait > 1000:
+                    grouped[operation]['requests_miss_wait_gt_1000ms'] += 1
             if request.get('miss_waits'):
                 grouped[operation]['requests_with_miss_wait'] += 1
             if request.get('hit_waits'):
@@ -317,9 +375,21 @@ class LatencyAnalyzer:
                 'requests_wait_gt_10ms': data['requests_wait_gt_10ms'],
                 'requests_wait_gt_100ms': data['requests_wait_gt_100ms'],
                 'requests_wait_gt_1000ms': data['requests_wait_gt_1000ms'],
+                'requests_miss_wait_gt_1ms': data['requests_miss_wait_gt_1ms'],
+                'requests_miss_wait_gt_10ms': data['requests_miss_wait_gt_10ms'],
+                'requests_miss_wait_gt_100ms': data['requests_miss_wait_gt_100ms'],
+                'requests_miss_wait_gt_1000ms': data['requests_miss_wait_gt_1000ms'],
+                'requests_hit_wait_gt_1ms': data['requests_hit_wait_gt_1ms'],
+                'requests_hit_wait_gt_10ms': data['requests_hit_wait_gt_10ms'],
+                'requests_hit_wait_gt_100ms': data['requests_hit_wait_gt_100ms'],
+                'requests_hit_wait_gt_1000ms': data['requests_hit_wait_gt_1000ms'],
                 'segments_per_request': self._calc_stats(data['segments_per_request']),
                 'per_request_max_wait': self._calc_stats(data['per_request_max_wait']),
                 'per_request_sum_wait': self._calc_stats(data['per_request_sum_wait']),
+                'per_request_miss_max_wait': self._calc_stats(data['per_request_miss_max_wait']),
+                'per_request_miss_sum_wait': self._calc_stats(data['per_request_miss_sum_wait']),
+                'per_request_hit_max_wait': self._calc_stats(data['per_request_hit_max_wait']),
+                'per_request_hit_sum_wait': self._calc_stats(data['per_request_hit_sum_wait']),
             }
             for operation, data in sorted(grouped.items())
         }
@@ -585,6 +655,30 @@ class LatencyAnalyzer:
         print("\n### SEARCH/QUERY PATH ANALYSIS")
         print("-" * 80)
         self._print_search_stats(search_stats)
+        physical_miss_waits = self._collect_request_latencies(
+            operation='Search',
+            stage='segment_cache_wait',
+            predicate=lambda e: self._is_truthy(e.get('cache_miss')) and str(e.get('status', 'ok')) == 'ok',
+            reducer='max',
+        )
+        if physical_miss_waits:
+            self._print_latency_bucket_distribution(
+                physical_miss_waits,
+                "Search physical cache-miss request max wait buckets",
+                indent="  ",
+            )
+        non_loader_waits = self._collect_request_latencies(
+            operation='Search',
+            stage='segment_cache_wait',
+            predicate=lambda e: not self._is_truthy(e.get('cache_miss')) and str(e.get('status', 'ok')) == 'ok',
+            reducer='max',
+        )
+        if non_loader_waits:
+            self._print_latency_bucket_distribution(
+                non_loader_waits,
+                "Search non-loader lazy access request max wait buckets",
+                indent="  ",
+            )
 
         print("\n### LOAD OPERATIONS ANALYSIS")
         print("-" * 80)
@@ -597,17 +691,37 @@ class LatencyAnalyzer:
         print("\n### QUERYNODE CACHE EXECUTION ANALYSIS")
         print("-" * 80)
         self._print_cache_execution_stats(cache_exec_stats)
+        direct_hit_exec = self._collect_request_latencies(
+            operation='Search',
+            stage='segment_search',
+            predicate=lambda e: str(e.get('segment_type', '')).lower() == 'sealed',
+            reducer='max',
+        )
+        if direct_hit_exec:
+            self._print_latency_bucket_distribution(
+                direct_hit_exec,
+                "Search QueryNode cache execution request max wait buckets",
+                indent="  ",
+            )
 
         print("\n### BOTTLENECK SUMMARY & OPTIMIZATION OPPORTUNITIES")
         print("-" * 80)
         self._print_bottleneck_summary(write_stats, search_stats, seg_stats, cache_exec_stats)
 
-        if HAS_PLOT_DEPS:
+        if HAS_CSV_DEPS:
             self._save_to_csv(output_path)
-            self._generate_plots(output_path, write_stats, search_stats, seg_stats, cache_exec_stats)
-            print(f"\nCSV and plots saved to {output_path}")
+            print(f"\nCSV saved to {output_path}")
         else:
-            print("\n(Install pandas/matplotlib/seaborn for CSV export and plots)")
+            print("\n(Install pandas for CSV export)")
+
+        if HAS_PLOT_DEPS:
+            self._generate_plots(output_path, write_stats, search_stats, seg_stats, cache_exec_stats)
+            print(f"Plots saved to {output_path}")
+            print(f"  - {output_path / 'search_physical_cache_miss_wait_histogram.png'}")
+            print(f"  - {output_path / 'search_non_loader_lazy_wait_histogram.png'}")
+            print(f"  - {output_path / 'search_querynode_cache_exec_histogram.png'}")
+        else:
+            print("(Install matplotlib for plots)")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -697,29 +811,47 @@ class LatencyAnalyzer:
                         f"{self._format_count_pct(req_stats.get('requests_with_miss_wait', 0), total_requests)}"
                     )
                     print(
+                        f"  {operation} physical cache-miss requests with max wait > 100ms: "
+                        f"{self._format_count_pct(req_stats.get('requests_miss_wait_gt_100ms', 0), total_requests)}"
+                    )
+                    print(
+                        f"  {operation} physical cache-miss requests with max wait > 1000ms: "
+                        f"{self._format_count_pct(req_stats.get('requests_miss_wait_gt_1000ms', 0), total_requests)}"
+                    )
+                    self._print_stats_dict(
+                        req_stats.get('per_request_miss_max_wait', {}),
+                        f"{operation} per-request physical cache-miss max wait",
+                        indent="    ",
+                    )
+                    self._print_stats_dict(
+                        req_stats.get('per_request_miss_sum_wait', {}),
+                        f"{operation} per-request physical cache-miss sum wait",
+                        indent="    ",
+                    )
+                    print(
                         f"  {operation} requests with non-loader lazy access: "
                         f"{self._format_count_pct(req_stats.get('requests_with_hit_wait', 0), total_requests)}"
                     )
                     print(
-                        f"  {operation} requests with max cache wait > 10ms: "
+                        f"  {operation} all lazy-access requests with max cache wait > 10ms: "
                         f"{self._format_count_pct(req_stats.get('requests_wait_gt_10ms', 0), total_requests)}"
                     )
                     print(
-                        f"  {operation} requests with max cache wait > 100ms: "
+                        f"  {operation} all lazy-access requests with max cache wait > 100ms: "
                         f"{self._format_count_pct(req_stats.get('requests_wait_gt_100ms', 0), total_requests)}"
                     )
                     print(
-                        f"  {operation} requests with max cache wait > 1000ms: "
+                        f"  {operation} all lazy-access requests with max cache wait > 1000ms: "
                         f"{self._format_count_pct(req_stats.get('requests_wait_gt_1000ms', 0), total_requests)}"
                     )
                     self._print_stats_dict(
                         req_stats.get('per_request_max_wait', {}),
-                        f"{operation} per-request max cache wait",
+                        f"{operation} per-request lazy-access max cache wait (all hits + misses)",
                         indent="    ",
                     )
                     self._print_stats_dict(
                         req_stats.get('per_request_sum_wait', {}),
-                        f"{operation} per-request sum cache wait",
+                        f"{operation} per-request lazy-access sum cache wait (all hits + misses)",
                         indent="    ",
                     )
         route_latency = stats.get('route_latency', {})
@@ -860,6 +992,23 @@ class LatencyAnalyzer:
         else:
             print(f"{indent}{label}: No data")
 
+    def _print_latency_bucket_distribution(
+        self,
+        durations: List[float],
+        label: str,
+        indent: str = "",
+    ):
+        buckets = self._build_latency_bucket_distribution(durations)
+        if not buckets:
+            print(f"{indent}{label}: No data")
+            return
+
+        total = len(durations)
+        print(f"{indent}{label}:")
+        print(f"{indent}  Count:    {total}")
+        for bucket_label, count in buckets:
+            print(f"{indent}  {bucket_label}: {self._format_count_pct(count, total)}")
+
     def _print_bottleneck_summary(self, write_stats, search_stats, seg_stats, cache_exec_stats):
         print("\nKEY FINDINGS:")
 
@@ -925,12 +1074,23 @@ class LatencyAnalyzer:
                         f"{self._format_count_pct(op_stats.get('requests_with_cache_wait', 0), total_op_requests)}"
                     )
                     print(
-                        f"   - {operation} requests with cache wait >100ms/>1000ms: "
+                        f"   - {operation} physical cache-miss requests >100ms/>1000ms: "
+                        f"{self._format_count_pct(op_stats.get('requests_miss_wait_gt_100ms', 0), total_op_requests)} / "
+                        f"{self._format_count_pct(op_stats.get('requests_miss_wait_gt_1000ms', 0), total_op_requests)}"
+                    )
+                    miss_max_wait = op_stats.get('per_request_miss_max_wait', {})
+                    if miss_max_wait.get('count', 0) > 0:
+                        print(
+                            f"   - {operation} physical cache-miss request max wait mean/P95: "
+                            f"{miss_max_wait.get('mean', 0):.2f} / {miss_max_wait.get('p95', 0):.2f} ms"
+                        )
+                    print(
+                        f"   - {operation} all lazy-access requests >100ms/>1000ms: "
                         f"{self._format_count_pct(op_stats.get('requests_wait_gt_100ms', 0), total_op_requests)} / "
                         f"{self._format_count_pct(op_stats.get('requests_wait_gt_1000ms', 0), total_op_requests)}"
                     )
                     print(
-                        f"   - {operation} request max cache wait mean/P95: "
+                        f"   - {operation} all lazy-access request max wait mean/P95: "
                         f"{max_wait.get('mean', 0):.2f} / {max_wait.get('p95', 0):.2f} ms"
                     )
 
@@ -961,7 +1121,8 @@ class LatencyAnalyzer:
         pd.DataFrame(trace_summary).to_csv(output_path / 'trace_summary.csv', index=False)
 
     def _generate_plots(self, output_path: Path, write_stats, search_stats, seg_stats, cache_exec_stats):
-        sns.set_style("whitegrid")
+        if HAS_SEABORN:
+            sns.set_style("whitegrid")
 
         # Write path stage breakdown
         stages = [(s, d) for s, d in write_stats.items() if d.get('count', 0) > 0]
@@ -1028,6 +1189,52 @@ class LatencyAnalyzer:
             plt.savefig(output_path / 'segment_type_distribution.png', dpi=300)
             plt.close()
 
+        # Request-level wait distributions for non-loader lazy access and direct cache execution
+        physical_miss_waits = self._collect_request_latencies(
+            operation='Search',
+            stage='segment_cache_wait',
+            predicate=lambda e: self._is_truthy(e.get('cache_miss')) and str(e.get('status', 'ok')) == 'ok',
+            reducer='max',
+        )
+        if physical_miss_waits:
+            self._plot_latency_histogram(
+                output_path / 'search_physical_cache_miss_wait_histogram.png',
+                physical_miss_waits,
+                title='Search Physical Cache-Miss Wait Latency Distribution',
+                xlabel='Latency (ms)',
+                ylabel='Request count',
+            )
+
+        non_loader_waits = self._collect_request_latencies(
+            operation='Search',
+            stage='segment_cache_wait',
+            predicate=lambda e: not self._is_truthy(e.get('cache_miss')) and str(e.get('status', 'ok')) == 'ok',
+            reducer='max',
+        )
+        if non_loader_waits:
+            self._plot_latency_histogram(
+                output_path / 'search_non_loader_lazy_wait_histogram.png',
+                non_loader_waits,
+                title='Search Non-Loader Lazy Access Latency Distribution',
+                xlabel='Latency (ms)',
+                ylabel='Request count',
+            )
+
+        direct_hit_exec = self._collect_request_latencies(
+            operation='Search',
+            stage='segment_search',
+            predicate=lambda e: str(e.get('segment_type', '')).lower() == 'sealed',
+            reducer='max',
+        )
+        if direct_hit_exec:
+            self._plot_latency_histogram(
+                output_path / 'search_querynode_cache_exec_histogram.png',
+                direct_hit_exec,
+                title='Search QueryNode Cache Execution Latency Distribution',
+                xlabel='Latency (ms)',
+                ylabel='Request count',
+            )
+
     @staticmethod
     def _format_count_pct(count: int, total: int) -> str:
         if total <= 0:
@@ -1051,6 +1258,97 @@ class LatencyAnalyzer:
         sd = sorted(data)
         idx = int(len(sd) * pct / 100)
         return sd[min(idx, len(sd) - 1)]
+
+    def _collect_request_latencies(
+        self,
+        operation: str,
+        stage: str,
+        predicate=None,
+        reducer: str = 'max',
+    ) -> List[float]:
+        """Collect per-request latencies from trace events.
+
+        The returned series contains one value per trace_id.
+        """
+        by_trace: Dict[str, List[float]] = defaultdict(list)
+        for event in self.traces:
+            if event.get('operation') != operation or event.get('stage') != stage:
+                continue
+            if predicate is not None and not predicate(event):
+                continue
+            trace_id = event.get('trace_id', '')
+            if not trace_id:
+                continue
+            by_trace[trace_id].append(event.get('duration_ms', 0))
+
+        series: List[float] = []
+        for durations in by_trace.values():
+            if not durations:
+                continue
+            if reducer == 'sum':
+                series.append(sum(durations))
+            else:
+                series.append(max(durations))
+        return series
+
+    @staticmethod
+    def _build_latency_bucket_distribution(durations: List[float]) -> List[Tuple[str, int]]:
+        if not durations:
+            return []
+
+        upper_bounds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
+        counts = [0] * (len(upper_bounds) + 1)
+        for duration in durations:
+            if duration <= 0:
+                counts[0] += 1
+                continue
+
+            placed = False
+            for idx, upper in enumerate(upper_bounds, start=1):
+                if duration <= upper:
+                    counts[idx] += 1
+                    placed = True
+                    break
+            if not placed:
+                counts[-1] += 1
+
+        buckets: List[Tuple[str, int]] = [('=0ms', counts[0])]
+        lower = 0
+        for idx, upper in enumerate(upper_bounds, start=1):
+            buckets.append((f'({lower},{upper}]ms', counts[idx]))
+            lower = upper
+        buckets.append((f'>{upper_bounds[-1]}ms', counts[-1]))
+        return buckets
+
+    def _plot_latency_histogram(
+        self,
+        output_file: Path,
+        durations: List[float],
+        title: str,
+        xlabel: str,
+        ylabel: str,
+    ):
+        if not durations:
+            return
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        bins = min(100, max(20, int(len(durations) ** 0.5)))
+        ax.hist(durations, bins=bins, color='#4c72b0', alpha=0.85, edgecolor='white')
+
+        mean_v = statistics.mean(durations)
+        p95_v = LatencyAnalyzer._percentile(durations, 95)
+        p99_v = LatencyAnalyzer._percentile(durations, 99)
+        ax.axvline(mean_v, color='#dd8452', linestyle='--', linewidth=1.5, label=f'Mean: {mean_v:.2f} ms')
+        ax.axvline(p95_v, color='#55a868', linestyle='--', linewidth=1.5, label=f'P95: {p95_v:.2f} ms')
+        ax.axvline(p99_v, color='#c44e52', linestyle='--', linewidth=1.5, label=f'P99: {p99_v:.2f} ms')
+
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(output_file, dpi=300)
+        plt.close(fig)
 
 
 def main():
