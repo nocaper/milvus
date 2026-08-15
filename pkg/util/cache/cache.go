@@ -142,11 +142,20 @@ type Stats struct {
 	EvictionCount       atomic.Uint64
 }
 
+type DoResult struct {
+	Missing        bool
+	WaitedForLoad  bool
+}
+
 type Cache[K comparable, V any] interface {
 	// Do the operation `doer` on the given key `key`. The key is kept in the cache until the operation
 	// completes.
 	// Throws `ErrNoSuchItem` if the key is not found or not able to be loaded from given loader.
 	Do(ctx context.Context, key K, doer func(context.Context, V) error) (missing bool, err error)
+
+	// DoWithResult behaves like Do and also reports whether the caller waited for another
+	// goroutine to finish loading the same key.
+	DoWithResult(ctx context.Context, key K, doer func(context.Context, V) error) (result DoResult, err error)
 
 	// Get stats
 	Stats() *Stats
@@ -249,24 +258,29 @@ func newLRUCache[K comparable, V any](
 }
 
 func (c *lruCache[K, V]) Do(ctx context.Context, key K, doer func(context.Context, V) error) (bool, error) {
+	result, err := c.DoWithResult(ctx, key, doer)
+	return result.Missing, err
+}
+
+func (c *lruCache[K, V]) DoWithResult(ctx context.Context, key K, doer func(context.Context, V) error) (DoResult, error) {
 	log := log.Ctx(ctx).With(zap.Any("key", key))
 	for {
 		// Get a listener before getAndPin to avoid missing the notification.
 		listener := c.waitNotifier.Listen(syncutil.VersionedListenAtLatest)
 
-		item, missing, err := c.getAndPin(ctx, key)
+		item, result, err := c.getAndPin(ctx, key)
 		if err == nil {
 			defer c.Unpin(key)
-			return missing, doer(ctx, item.value)
+			return result, doer(ctx, item.value)
 		} else if err != ErrNotEnoughSpace {
-			return true, err
+			return DoResult{Missing: true}, err
 		}
 		log.Warn("Failed to get disk cache for segment, wait and try again", zap.Error(err))
 
 		// wait for the listener to be notified.
 		if err := listener.Wait(ctx); err != nil {
 			log.Warn("failed to get item for key with timeout", zap.Error(context.Cause(ctx)))
-			return true, err
+			return DoResult{Missing: true}, err
 		}
 	}
 }
@@ -328,10 +342,10 @@ func (c *lruCache[K, V]) peekAndPin(ctx context.Context, key K) *cacheItem[K, V]
 }
 
 // GetAndPin gets and pins the given key if it exists
-func (c *lruCache[K, V]) getAndPin(ctx context.Context, key K) (*cacheItem[K, V], bool, error) {
+func (c *lruCache[K, V]) getAndPin(ctx context.Context, key K) (*cacheItem[K, V], DoResult, error) {
 	if item := c.peekAndPin(ctx, key); item != nil {
 		c.stats.HitCount.Inc()
-		return item, false, nil
+		return item, DoResult{}, nil
 	}
 	log := log.Ctx(ctx)
 	c.stats.MissCount.Inc()
@@ -340,12 +354,12 @@ func (c *lruCache[K, V]) getAndPin(ctx context.Context, key K) (*cacheItem[K, V]
 		//	Note that the test is not accurate since we are not locking `loader` here.
 		if _, ok := c.tryScavenge(key); !ok {
 			log.Warn("getAndPin ran into scavenge failure, return", zap.Any("key", key))
-			return nil, true, ErrNotEnoughSpace
+			return nil, DoResult{Missing: true}, ErrNotEnoughSpace
 		}
 		c.loaderKeyLocks.Lock(key)
 		defer c.loaderKeyLocks.Unlock(key)
 		if item := c.peekAndPin(ctx, key); item != nil {
-			return item, false, nil
+			return item, DoResult{WaitedForLoad: true}, nil
 		}
 		timer := time.Now()
 		value, err := c.loader(ctx, key)
@@ -359,7 +373,7 @@ func (c *lruCache[K, V]) getAndPin(ctx context.Context, key K) (*cacheItem[K, V]
 		if err != nil {
 			c.stats.LoadFailCount.Inc()
 			log.Debug("loader failed for key", zap.Any("key", key))
-			return nil, true, err
+			return nil, DoResult{Missing: true}, err
 		}
 
 		c.stats.TotalLoadTimeMs.Add(uint64(time.Since(timer).Milliseconds()))
@@ -367,11 +381,11 @@ func (c *lruCache[K, V]) getAndPin(ctx context.Context, key K) (*cacheItem[K, V]
 		item, err := c.setAndPin(ctx, key, value)
 		if err != nil {
 			log.Debug("setAndPin failed for key", zap.Any("key", key), zap.Error(err))
-			return nil, true, err
+			return nil, DoResult{Missing: true}, err
 		}
-		return item, true, nil
+		return item, DoResult{Missing: true}, nil
 	}
-	return nil, true, ErrNoSuchItem
+	return nil, DoResult{Missing: true}, ErrNoSuchItem
 }
 
 func (c *lruCache[K, V]) tryScavenge(key K) ([]K, bool) {

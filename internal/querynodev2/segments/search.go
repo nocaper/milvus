@@ -30,6 +30,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querynodev2/segments/metricsutil"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/cache"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/timerecord"
 )
@@ -83,20 +84,22 @@ func searchSegments(ctx context.Context, mgr *Manager, segments []Segment, segTy
 				ctx, cancel := withLazyLoadTimeoutContext(ctx)
 				defer cancel()
 
+				var result cache.DoResult
 				var missing bool
 				traceCtx := withLatencyTraceOperation(ctx, "Search")
 				cacheWaitStart := time.Now()
 				cacheWaitDuration := time.Duration(0)
 				doStarted := false
-				missing, err = mgr.DiskCache.Do(traceCtx, seg.ID(), func(ctx context.Context, segment Segment) error {
+				result, err = mgr.DiskCache.DoWithResult(traceCtx, seg.ID(), func(ctx context.Context, segment Segment) error {
 					cacheWaitDuration = time.Since(cacheWaitStart)
 					doStarted = true
 					return searcher(ctx, segment)
 				})
+				missing = result.Missing
 				if !doStarted {
 					cacheWaitDuration = time.Since(cacheWaitStart)
 				}
-				recordSegmentCacheWait(traceCtx, "Search", seg, cacheWaitDuration, missing, err)
+				recordSegmentCacheWait(traceCtx, "Search", seg, cacheWaitDuration, missing, result.WaitedForLoad, err)
 				if missing {
 					accessRecord.CacheMissing()
 				}
@@ -186,20 +189,22 @@ func searchSegmentsStreamly(ctx context.Context,
 				ctx, cancel := withLazyLoadTimeoutContext(ctx)
 				defer cancel()
 
+				var result cache.DoResult
 				var missing bool
 				traceCtx := withLatencyTraceOperation(ctx, "Search")
 				cacheWaitStart := time.Now()
 				cacheWaitDuration := time.Duration(0)
 				doStarted := false
-				missing, err = mgr.DiskCache.Do(traceCtx, seg.ID(), func(ctx context.Context, segment Segment) error {
+				result, err = mgr.DiskCache.DoWithResult(traceCtx, seg.ID(), func(ctx context.Context, segment Segment) error {
 					cacheWaitDuration = time.Since(cacheWaitStart)
 					doStarted = true
 					return searcher(ctx, segment)
 				})
+				missing = result.Missing
 				if !doStarted {
 					cacheWaitDuration = time.Since(cacheWaitStart)
 				}
-				recordSegmentCacheWait(traceCtx, "Search", seg, cacheWaitDuration, missing, err)
+				recordSegmentCacheWait(traceCtx, "Search", seg, cacheWaitDuration, missing, result.WaitedForLoad, err)
 				if missing {
 					accessRecord.CacheMissing()
 				}

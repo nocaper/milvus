@@ -197,13 +197,26 @@ func (loader *segmentLoaderV2) Load(ctx context.Context,
 	// continue to wait other task done
 	log.Info("start loading...", zap.Int("segmentNum", len(segments)), zap.Int("afterFilter", len(infos)))
 
-	// Check memory & storage limit
-	requestResourceResult, err := loader.requestResource(ctx, infos...)
-	if err != nil {
-		log.Warn("request resource failed", zap.Error(err))
+	collection := loader.manager.Collection.Get(collectionID)
+	if collection == nil {
+		err := merr.WrapErrCollectionNotFound(collectionID)
+		log.Warn("failed to get collection", zap.Error(err))
 		return nil, err
 	}
-	defer loader.freeRequest(requestResourceResult.Resource)
+
+	var requestResourceResult requestResourceResult
+	if !isLazyLoad(collection, segmentType) {
+		// Check memory & storage limit. Lazy-load sealed segments request resource when
+		// Search/Query first touches the segment.
+		requestResourceResult, err = loader.requestResource(ctx, infos...)
+		if err != nil {
+			log.Warn("request resource failed", zap.Error(err))
+			return nil, err
+		}
+		defer loader.freeRequest(requestResourceResult.Resource)
+	} else {
+		requestResourceResult.ConcurrencyLevel = len(infos)
+	}
 
 	newSegments := typeutil.NewConcurrentMap[int64, Segment]()
 	loaded := typeutil.NewConcurrentMap[int64, Segment]()
@@ -217,13 +230,6 @@ func (loader *segmentLoaderV2) Load(ctx context.Context,
 
 	for _, info := range infos {
 		loadInfo := info
-
-		collection := loader.manager.Collection.Get(loadInfo.GetCollectionID())
-		if collection == nil {
-			err := merr.WrapErrCollectionNotFound(loadInfo.GetCollectionID())
-			log.Warn("failed to get collection", zap.Error(err))
-			return nil, err
-		}
 
 		segment, err := NewSegmentV2(ctx, collection, segmentType, version, loadInfo)
 		if err != nil {
@@ -252,7 +258,10 @@ func (loader *segmentLoaderV2) Load(ctx context.Context,
 		if loadInfo.GetLevel() == datapb.SegmentLevel_L0 {
 			err = loader.LoadDelta(ctx, collectionID, segment.(*LocalSegment))
 		} else {
-			err = loader.LoadSegment(ctx, segment.(*LocalSegment), loadInfo)
+			s := segment.(*LocalSegment)
+			if !s.IsLazyLoad() {
+				err = loader.LoadSegment(ctx, s, loadInfo)
+			}
 		}
 		if err != nil {
 			log.Warn("load segment failed when load data into memory",
@@ -527,7 +536,14 @@ func (loader *segmentLoaderV2) LoadLazySegment(ctx context.Context,
 	segment *LocalSegment,
 	loadInfo *querypb.SegmentLoadInfo,
 ) (err error) {
-	return merr.ErrOperationNotSupported
+	resource, err := loader.requestResourceWithTimeout(ctx, loadInfo)
+	if err != nil {
+		log.Ctx(ctx).Warn("request resource failed", zap.Error(err))
+		return err
+	}
+	defer loader.freeRequest(resource)
+
+	return loader.LoadSegment(ctx, segment, loadInfo)
 }
 
 func (loader *segmentLoaderV2) loadSealedSegmentFields(ctx context.Context, segment *LocalSegment, fields *typeutil.ConcurrentMap[int64, *schemapb.FieldSchema], rowCount int64) error {

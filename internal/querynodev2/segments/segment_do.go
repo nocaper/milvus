@@ -10,6 +10,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querynodev2/segments/metricsutil"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/tracer"
+	"github.com/milvus-io/milvus/pkg/util/cache"
 	"github.com/milvus-io/milvus/pkg/util/conc"
 )
 
@@ -25,10 +26,12 @@ func getLatencyTraceOperation(ctx context.Context) string {
 	return operation
 }
 
-func recordSegmentCacheWait(ctx context.Context, operation string, segment Segment, duration time.Duration, missing bool, err error) {
+func recordSegmentCacheWait(ctx context.Context, operation string, segment Segment, duration time.Duration, missing bool, waitedForLoad bool, err error) {
 	source := "querynode_cache"
 	if missing {
 		source = "object_store"
+	} else if waitedForLoad {
+		source = "wait_for_loader"
 	}
 	status := "ok"
 	if err != nil {
@@ -49,6 +52,7 @@ func recordSegmentCacheWait(ctx context.Context, operation string, segment Segme
 			"segment_type":  segment.Type().String(),
 			"cache_miss":    missing,
 			"cache_hit":     !missing,
+			"waited_for_load": waitedForLoad,
 			"status":        status,
 		},
 	)
@@ -89,20 +93,22 @@ func doOnSegment(ctx context.Context, mgr *Manager, seg Segment, do doOnSegmentF
 		ctx, cancel := withLazyLoadTimeoutContext(ctx)
 		defer cancel()
 
+		var result cache.DoResult
 		var missing bool
 		traceCtx := withLatencyTraceOperation(ctx, "Query")
 		cacheWaitStart := time.Now()
 		cacheWaitDuration := time.Duration(0)
 		doStarted := false
-		missing, err = mgr.DiskCache.Do(traceCtx, seg.ID(), func(ctx context.Context, segment Segment) error {
+		result, err = mgr.DiskCache.DoWithResult(traceCtx, seg.ID(), func(ctx context.Context, segment Segment) error {
 			cacheWaitDuration = time.Since(cacheWaitStart)
 			doStarted = true
 			return do(ctx, segment)
 		})
+		missing = result.Missing
 		if !doStarted {
 			cacheWaitDuration = time.Since(cacheWaitStart)
 		}
-		recordSegmentCacheWait(traceCtx, "Query", seg, cacheWaitDuration, missing, err)
+		recordSegmentCacheWait(traceCtx, "Query", seg, cacheWaitDuration, missing, result.WaitedForLoad, err)
 		if missing {
 			accessRecord.CacheMissing()
 		}

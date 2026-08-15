@@ -185,6 +185,7 @@ class LatencyAnalyzer:
             'durations': [],
             'segments': set(),
             'miss_waits': [],
+            'waited_waits': [],
             'hit_waits': [],
             'error_waits': [],
         })
@@ -219,7 +220,14 @@ class LatencyAnalyzer:
                 duration = event.get('duration_ms', 0)
                 status = str(event.get('status', 'ok'))
                 cache_miss = self._is_truthy(event.get('cache_miss'))
-                result = 'cache_miss' if cache_miss else 'cache_hit'
+                waited_for_load = self._is_truthy(event.get('waited_for_load'))
+                has_waited_field = 'waited_for_load' in event
+                if cache_miss:
+                    result = 'cache_miss'
+                elif has_waited_field and waited_for_load:
+                    result = 'waited_for_load'
+                else:
+                    result = 'cache_hit'
                 if status != 'ok':
                     result = 'error'
                 cache_wait_latency[operation].append(duration)
@@ -232,6 +240,8 @@ class LatencyAnalyzer:
                     request['segments'].add(event.get('segment_id'))
                 if result == 'cache_miss':
                     request['miss_waits'].append(duration)
+                elif result == 'waited_for_load':
+                    request['waited_waits'].append(duration)
                 elif result == 'cache_hit':
                     request['hit_waits'].append(duration)
                 else:
@@ -290,10 +300,13 @@ class LatencyAnalyzer:
             'per_request_sum_wait': [],
             'per_request_miss_max_wait': [],
             'per_request_miss_sum_wait': [],
+            'per_request_waited_max_wait': [],
+            'per_request_waited_sum_wait': [],
             'per_request_hit_max_wait': [],
             'per_request_hit_sum_wait': [],
             'segments_per_request': [],
             'requests_with_miss_wait': 0,
+            'requests_with_waited_wait': 0,
             'requests_with_hit_wait': 0,
             'requests_with_error_wait': 0,
             'requests_wait_gt_1ms': 0,
@@ -324,6 +337,7 @@ class LatencyAnalyzer:
 
             hit_waits = request.get('hit_waits', [])
             miss_waits = request.get('miss_waits', [])
+            waited_waits = request.get('waited_waits', [])
             if hit_waits:
                 hit_max_wait = max(hit_waits)
                 grouped[operation]['per_request_hit_max_wait'].append(hit_max_wait)
@@ -337,6 +351,19 @@ class LatencyAnalyzer:
                     grouped[operation]['requests_hit_wait_gt_100ms'] += 1
                 if hit_max_wait > 1000:
                     grouped[operation]['requests_hit_wait_gt_1000ms'] += 1
+            if waited_waits:
+                waited_max_wait = max(waited_waits)
+                grouped[operation]['per_request_waited_max_wait'].append(waited_max_wait)
+                grouped[operation]['per_request_waited_sum_wait'].append(sum(waited_waits))
+                grouped[operation]['physical_loader_waits'].extend(waited_waits)
+                if waited_max_wait > 1:
+                    grouped[operation]['requests_waited_wait_gt_1ms'] += 1
+                if waited_max_wait > 10:
+                    grouped[operation]['requests_waited_wait_gt_10ms'] += 1
+                if waited_max_wait > 100:
+                    grouped[operation]['requests_waited_wait_gt_100ms'] += 1
+                if waited_max_wait > 1000:
+                    grouped[operation]['requests_waited_wait_gt_1000ms'] += 1
             if miss_waits:
                 miss_max_wait = max(miss_waits)
                 grouped[operation]['per_request_miss_max_wait'].append(miss_max_wait)
@@ -352,6 +379,8 @@ class LatencyAnalyzer:
                     grouped[operation]['requests_miss_wait_gt_1000ms'] += 1
             if request.get('miss_waits'):
                 grouped[operation]['requests_with_miss_wait'] += 1
+            if request.get('waited_waits'):
+                grouped[operation]['requests_with_waited_wait'] += 1
             if request.get('hit_waits'):
                 grouped[operation]['requests_with_hit_wait'] += 1
             if request.get('error_waits'):
@@ -369,12 +398,17 @@ class LatencyAnalyzer:
             operation: {
                 'requests_with_cache_wait': len(data['per_request_max_wait']),
                 'requests_with_miss_wait': data['requests_with_miss_wait'],
+                'requests_with_waited_wait': data['requests_with_waited_wait'],
                 'requests_with_hit_wait': data['requests_with_hit_wait'],
                 'requests_with_error_wait': data['requests_with_error_wait'],
                 'requests_wait_gt_1ms': data['requests_wait_gt_1ms'],
                 'requests_wait_gt_10ms': data['requests_wait_gt_10ms'],
                 'requests_wait_gt_100ms': data['requests_wait_gt_100ms'],
                 'requests_wait_gt_1000ms': data['requests_wait_gt_1000ms'],
+                'requests_waited_wait_gt_1ms': data['requests_waited_wait_gt_1ms'],
+                'requests_waited_wait_gt_10ms': data['requests_waited_wait_gt_10ms'],
+                'requests_waited_wait_gt_100ms': data['requests_waited_wait_gt_100ms'],
+                'requests_waited_wait_gt_1000ms': data['requests_waited_wait_gt_1000ms'],
                 'requests_miss_wait_gt_1ms': data['requests_miss_wait_gt_1ms'],
                 'requests_miss_wait_gt_10ms': data['requests_miss_wait_gt_10ms'],
                 'requests_miss_wait_gt_100ms': data['requests_miss_wait_gt_100ms'],
@@ -388,6 +422,8 @@ class LatencyAnalyzer:
                 'per_request_sum_wait': self._calc_stats(data['per_request_sum_wait']),
                 'per_request_miss_max_wait': self._calc_stats(data['per_request_miss_max_wait']),
                 'per_request_miss_sum_wait': self._calc_stats(data['per_request_miss_sum_wait']),
+                'per_request_waited_max_wait': self._calc_stats(data['per_request_waited_max_wait']),
+                'per_request_waited_sum_wait': self._calc_stats(data['per_request_waited_sum_wait']),
                 'per_request_hit_max_wait': self._calc_stats(data['per_request_hit_max_wait']),
                 'per_request_hit_sum_wait': self._calc_stats(data['per_request_hit_sum_wait']),
             }
@@ -655,6 +691,41 @@ class LatencyAnalyzer:
         print("\n### SEARCH/QUERY PATH ANALYSIS")
         print("-" * 80)
         self._print_search_stats(search_stats)
+
+        print("\n### SEARCH CACHE_MISS=TRUE COLD LOAD PATH")
+        print("-" * 80)
+        search_cache_miss_wait = (
+            search_stats
+            .get('cache_wait_by_result', {})
+            .get('Search', {})
+            .get('cache_miss', {})
+        )
+        if search_cache_miss_wait.get('count', 0) > 0:
+            print("Segment-level waits where segment_cache_wait.cache_miss=true:")
+            self._print_stats_dict(search_cache_miss_wait, indent="  ")
+            search_request_overhead = (
+                search_stats
+                .get('cache_wait_request_overhead', {})
+                .get('Search', {})
+            )
+            total_search_requests = search_stats.get('search_requests', 0)
+            print(
+                "Search requests that performed physical object-store load: "
+                f"{self._format_count_pct(search_request_overhead.get('requests_with_miss_wait', 0), total_search_requests)}"
+            )
+            self._print_stats_dict(
+                search_request_overhead.get('per_request_miss_max_wait', {}),
+                "Per-request physical cache-miss max wait",
+                indent="  ",
+            )
+            self._print_stats_dict(
+                search_request_overhead.get('per_request_miss_sum_wait', {}),
+                "Per-request physical cache-miss sum wait",
+                indent="  ",
+            )
+        else:
+            print("No Search segment_cache_wait events with cache_miss=true.")
+
         physical_miss_waits = self._collect_request_latencies(
             operation='Search',
             stage='segment_cache_wait',
@@ -667,18 +738,64 @@ class LatencyAnalyzer:
                 "Search physical cache-miss request max wait buckets",
                 indent="  ",
             )
-        non_loader_waits = self._collect_request_latencies(
-            operation='Search',
-            stage='segment_cache_wait',
-            predicate=lambda e: not self._is_truthy(e.get('cache_miss')) and str(e.get('status', 'ok')) == 'ok',
-            reducer='max',
-        )
-        if non_loader_waits:
-            self._print_latency_bucket_distribution(
-                non_loader_waits,
-                "Search non-loader lazy access request max wait buckets",
-                indent="  ",
+        search_wait_events = [
+            e for e in self.traces
+            if e.get('operation') == 'Search'
+            and e.get('stage') == 'segment_cache_wait'
+            and str(e.get('status', 'ok')) == 'ok'
+        ]
+        has_waited_field = any('waited_for_load' in e for e in search_wait_events)
+        print("\n### SEARCH CACHE_MISS=FALSE ACCESS PATH")
+        print("-" * 80)
+        if has_waited_field:
+            print("This splits cache_miss=false into direct hits and requests that waited for an in-flight loader.")
+            waited_for_load_waits = self._collect_request_latencies(
+                operation='Search',
+                stage='segment_cache_wait',
+                predicate=lambda e: self._is_truthy(e.get('waited_for_load')) and str(e.get('status', 'ok')) == 'ok',
+                reducer='max',
             )
+            if waited_for_load_waits:
+                self._print_latency_bucket_distribution(
+                    waited_for_load_waits,
+                    "Search waited-for-load request max wait buckets",
+                    indent="  ",
+                )
+            direct_hit_waits = self._collect_request_latencies(
+                operation='Search',
+                stage='segment_cache_wait',
+                predicate=lambda e: (not self._is_truthy(e.get('cache_miss')))
+                                     and (not self._is_truthy(e.get('waited_for_load')))
+                                     and str(e.get('status', 'ok')) == 'ok',
+                reducer='max',
+            )
+            if direct_hit_waits:
+                self._print_latency_bucket_distribution(
+                    direct_hit_waits,
+                    "Search direct cache-hit request max wait buckets",
+                    indent="  ",
+                )
+            else:
+                print("No Search segment_cache_wait events with direct cache hit.")
+        else:
+            print(
+                "The current trace does not carry waited_for_load, so cache_miss=false is still an aggregate "
+                "of direct hits and requests waiting behind another loader."
+            )
+            non_loader_waits = self._collect_request_latencies(
+                operation='Search',
+                stage='segment_cache_wait',
+                predicate=lambda e: not self._is_truthy(e.get('cache_miss')) and str(e.get('status', 'ok')) == 'ok',
+                reducer='max',
+            )
+            if non_loader_waits:
+                self._print_latency_bucket_distribution(
+                    non_loader_waits,
+                    "Search cache_miss=false request max wait buckets",
+                    indent="  ",
+                )
+            else:
+                print("No Search segment_cache_wait events with cache_miss=false.")
 
         print("\n### LOAD OPERATIONS ANALYSIS")
         print("-" * 80)
@@ -700,7 +817,7 @@ class LatencyAnalyzer:
         if direct_hit_exec:
             self._print_latency_bucket_distribution(
                 direct_hit_exec,
-                "Search QueryNode cache execution request max wait buckets",
+                "Search QueryNode cache execution request max execution buckets",
                 indent="  ",
             )
 
@@ -718,6 +835,8 @@ class LatencyAnalyzer:
             self._generate_plots(output_path, write_stats, search_stats, seg_stats, cache_exec_stats)
             print(f"Plots saved to {output_path}")
             print(f"  - {output_path / 'search_physical_cache_miss_wait_histogram.png'}")
+            print(f"  - {output_path / 'search_waited_for_load_histogram.png'}")
+            print(f"  - {output_path / 'search_direct_cache_hit_histogram.png'}")
             print(f"  - {output_path / 'search_non_loader_lazy_wait_histogram.png'}")
             print(f"  - {output_path / 'search_querynode_cache_exec_histogram.png'}")
         else:
@@ -789,26 +908,32 @@ class LatencyAnalyzer:
                 self._print_stats_dict(op_stats, f"{operation} segment_cache_wait", indent="  ")
 
                 by_result = cache_wait_by_result.get(operation, {})
-                for result in ('cache_miss', 'cache_hit', 'error'):
+                for result in ('cache_miss', 'waited_for_load', 'cache_hit', 'error'):
                     result_stats = by_result.get(result, {})
                     if result_stats.get('count', 0) > 0:
                         label = result
                         if result == 'cache_miss':
                             label = 'physical cache-miss loader'
+                        elif result == 'waited_for_load':
+                            label = 'waited for in-flight loader'
                         elif result == 'cache_hit':
-                            label = 'non-loader lazy access'
+                            label = 'direct cache hit'
                         self._print_stats_dict(result_stats, f"{operation} wait on {label}", indent="    ")
 
                 req_stats = request_overhead.get(operation, {})
                 if req_stats:
                     total_requests = stats.get('search_requests' if operation == 'Search' else 'query_requests', 0)
                     print(
-                        f"  {operation} requests with lazy segment access: "
+                        f"  {operation} requests with lazy segment access (coverage only): "
                         f"{self._format_count_pct(req_stats.get('requests_with_cache_wait', 0), total_requests)}"
                     )
                     print(
                         f"  {operation} requests that performed the physical miss load: "
                         f"{self._format_count_pct(req_stats.get('requests_with_miss_wait', 0), total_requests)}"
+                    )
+                    print(
+                        f"  {operation} requests that waited for in-flight load: "
+                        f"{self._format_count_pct(req_stats.get('requests_with_waited_wait', 0), total_requests)}"
                     )
                     print(
                         f"  {operation} physical cache-miss requests with max wait > 100ms: "
@@ -829,29 +954,17 @@ class LatencyAnalyzer:
                         indent="    ",
                     )
                     print(
-                        f"  {operation} requests with non-loader lazy access: "
+                        f"  {operation} requests with direct cache hit: "
                         f"{self._format_count_pct(req_stats.get('requests_with_hit_wait', 0), total_requests)}"
                     )
-                    print(
-                        f"  {operation} all lazy-access requests with max cache wait > 10ms: "
-                        f"{self._format_count_pct(req_stats.get('requests_wait_gt_10ms', 0), total_requests)}"
-                    )
-                    print(
-                        f"  {operation} all lazy-access requests with max cache wait > 100ms: "
-                        f"{self._format_count_pct(req_stats.get('requests_wait_gt_100ms', 0), total_requests)}"
-                    )
-                    print(
-                        f"  {operation} all lazy-access requests with max cache wait > 1000ms: "
-                        f"{self._format_count_pct(req_stats.get('requests_wait_gt_1000ms', 0), total_requests)}"
-                    )
                     self._print_stats_dict(
-                        req_stats.get('per_request_max_wait', {}),
-                        f"{operation} per-request lazy-access max cache wait (all hits + misses)",
+                        req_stats.get('per_request_waited_max_wait', {}),
+                        f"{operation} per-request waited-for-load max wait",
                         indent="    ",
                     )
                     self._print_stats_dict(
-                        req_stats.get('per_request_sum_wait', {}),
-                        f"{operation} per-request lazy-access sum cache wait (all hits + misses)",
+                        req_stats.get('per_request_waited_sum_wait', {}),
+                        f"{operation} per-request waited-for-load sum wait",
                         indent="    ",
                     )
         route_latency = stats.get('route_latency', {})
@@ -1070,13 +1183,22 @@ class LatencyAnalyzer:
                 if max_wait.get('count', 0) > 0:
                     total_op_requests = search_stats.get('search_requests' if operation == 'Search' else 'query_requests', 0)
                     print(
-                        f"   - {operation} requests with lazy segment cache wait: "
+                        f"   - {operation} requests with lazy segment access (coverage only): "
                         f"{self._format_count_pct(op_stats.get('requests_with_cache_wait', 0), total_op_requests)}"
+                    )
+                    print(
+                        f"   - {operation} requests that waited for in-flight load: "
+                        f"{self._format_count_pct(op_stats.get('requests_with_waited_wait', 0), total_op_requests)}"
                     )
                     print(
                         f"   - {operation} physical cache-miss requests >100ms/>1000ms: "
                         f"{self._format_count_pct(op_stats.get('requests_miss_wait_gt_100ms', 0), total_op_requests)} / "
                         f"{self._format_count_pct(op_stats.get('requests_miss_wait_gt_1000ms', 0), total_op_requests)}"
+                    )
+                    print(
+                        f"   - {operation} waited-for-load requests >100ms/>1000ms: "
+                        f"{self._format_count_pct(op_stats.get('requests_waited_wait_gt_100ms', 0), total_op_requests)} / "
+                        f"{self._format_count_pct(op_stats.get('requests_waited_wait_gt_1000ms', 0), total_op_requests)}"
                     )
                     miss_max_wait = op_stats.get('per_request_miss_max_wait', {})
                     if miss_max_wait.get('count', 0) > 0:
@@ -1084,15 +1206,12 @@ class LatencyAnalyzer:
                             f"   - {operation} physical cache-miss request max wait mean/P95: "
                             f"{miss_max_wait.get('mean', 0):.2f} / {miss_max_wait.get('p95', 0):.2f} ms"
                         )
-                    print(
-                        f"   - {operation} all lazy-access requests >100ms/>1000ms: "
-                        f"{self._format_count_pct(op_stats.get('requests_wait_gt_100ms', 0), total_op_requests)} / "
-                        f"{self._format_count_pct(op_stats.get('requests_wait_gt_1000ms', 0), total_op_requests)}"
-                    )
-                    print(
-                        f"   - {operation} all lazy-access request max wait mean/P95: "
-                        f"{max_wait.get('mean', 0):.2f} / {max_wait.get('p95', 0):.2f} ms"
-                    )
+                    waited_max_wait = op_stats.get('per_request_waited_max_wait', {})
+                    if waited_max_wait.get('count', 0) > 0:
+                        print(
+                            f"   - {operation} waited-for-load request max wait mean/P95: "
+                            f"{waited_max_wait.get('mean', 0):.2f} / {waited_max_wait.get('p95', 0):.2f} ms"
+                        )
 
         if hot_search.get('count', 0) > 0 or hot_query.get('count', 0) > 0:
             print("\n4. QUERYNODE CACHE EXECUTION:")
@@ -1189,7 +1308,7 @@ class LatencyAnalyzer:
             plt.savefig(output_path / 'segment_type_distribution.png', dpi=300)
             plt.close()
 
-        # Request-level wait distributions for non-loader lazy access and direct cache execution
+        # Request-level wait distributions for physical miss, waiter, and direct hit paths
         physical_miss_waits = self._collect_request_latencies(
             operation='Search',
             stage='segment_cache_wait',
@@ -1204,21 +1323,60 @@ class LatencyAnalyzer:
                 xlabel='Latency (ms)',
                 ylabel='Request count',
             )
-
-        non_loader_waits = self._collect_request_latencies(
-            operation='Search',
-            stage='segment_cache_wait',
-            predicate=lambda e: not self._is_truthy(e.get('cache_miss')) and str(e.get('status', 'ok')) == 'ok',
-            reducer='max',
-        )
-        if non_loader_waits:
-            self._plot_latency_histogram(
-                output_path / 'search_non_loader_lazy_wait_histogram.png',
-                non_loader_waits,
-                title='Search Non-Loader Lazy Access Latency Distribution',
-                xlabel='Latency (ms)',
-                ylabel='Request count',
+        search_wait_events = [
+            e for e in self.traces
+            if e.get('operation') == 'Search'
+            and e.get('stage') == 'segment_cache_wait'
+            and str(e.get('status', 'ok')) == 'ok'
+        ]
+        has_waited_field = any('waited_for_load' in e for e in search_wait_events)
+        if has_waited_field:
+            waited_for_load_waits = self._collect_request_latencies(
+                operation='Search',
+                stage='segment_cache_wait',
+                predicate=lambda e: self._is_truthy(e.get('waited_for_load')) and str(e.get('status', 'ok')) == 'ok',
+                reducer='max',
             )
+            if waited_for_load_waits:
+                self._plot_latency_histogram(
+                    output_path / 'search_waited_for_load_histogram.png',
+                    waited_for_load_waits,
+                    title='Search Waited-for-Load Latency Distribution',
+                    xlabel='Latency (ms)',
+                    ylabel='Request count',
+                )
+
+            direct_hit_waits = self._collect_request_latencies(
+                operation='Search',
+                stage='segment_cache_wait',
+                predicate=lambda e: (not self._is_truthy(e.get('cache_miss')))
+                                     and (not self._is_truthy(e.get('waited_for_load')))
+                                     and str(e.get('status', 'ok')) == 'ok',
+                reducer='max',
+            )
+            if direct_hit_waits:
+                self._plot_latency_histogram(
+                    output_path / 'search_direct_cache_hit_histogram.png',
+                    direct_hit_waits,
+                    title='Search Direct Cache Hit Latency Distribution',
+                    xlabel='Latency (ms)',
+                    ylabel='Request count',
+                )
+        else:
+            non_loader_waits = self._collect_request_latencies(
+                operation='Search',
+                stage='segment_cache_wait',
+                predicate=lambda e: not self._is_truthy(e.get('cache_miss')) and str(e.get('status', 'ok')) == 'ok',
+                reducer='max',
+            )
+            if non_loader_waits:
+                self._plot_latency_histogram(
+                    output_path / 'search_non_loader_lazy_wait_histogram.png',
+                    non_loader_waits,
+                    title='Search Non-Loader Lazy Access Latency Distribution',
+                    xlabel='Latency (ms)',
+                    ylabel='Request count',
+                )
 
         direct_hit_exec = self._collect_request_latencies(
             operation='Search',
@@ -1297,7 +1455,7 @@ class LatencyAnalyzer:
             return []
 
         upper_bounds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
-        counts = [0] * (len(upper_bounds) + 1)
+        counts = [0] * (len(upper_bounds) + 2)
         for duration in durations:
             if duration <= 0:
                 counts[0] += 1
