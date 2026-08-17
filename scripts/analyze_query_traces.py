@@ -100,6 +100,7 @@ class QueryRequest:
     """单个 Query 请求的完整信息"""
     trace_id: str
     path: QueryPath
+    operation: str = "Query"
 
     # 各阶段延迟
     route_ms: float = 0.0
@@ -213,6 +214,11 @@ def parse_trace_line(line: str) -> Optional[dict]:
     return event
 
 
+# Both read operations use the same route/cache path shape. Search differs
+# only in the hot segment execution stage: segment_search vs segment_query.
+READ_OPERATIONS = ("Search", "Query")
+
+
 # ============================================================================
 # Query 分析器
 # ============================================================================
@@ -224,6 +230,8 @@ class QueryAnalyzer:
         self.events: List[dict] = []
         self.events_by_trace: Dict[str, List[dict]] = defaultdict(list)
         self.query_requests: Dict[str, QueryRequest] = {}
+        self.operation_trace_ids: Dict[str, set] = defaultdict(set)
+        self.operation_counts: Dict[str, int] = defaultdict(int)
 
         # 统计信息
         self.total_lines = 0
@@ -251,31 +259,47 @@ class QueryAnalyzer:
                     self.parsed_lines += 1
                     self.events.append(event)
 
-                    # 只关注 Query 操作
-                    if event['operation'] == 'Query':
+                    # Keep only Search/Query operations for request analysis.
+                    self.operation_counts[event['operation']] += 1
+                    if event['operation'] in READ_OPERATIONS:
                         trace_id = event['trace_id']
                         self.events_by_trace[trace_id].append(event)
+                        self.operation_trace_ids[event['operation']].add(trace_id)
         finally:
             if filepath != '-':
                 source.close()
 
         self.query_traces = len(self.events_by_trace)
         print(f"✓ Loaded {self.parsed_lines} trace events from {self.total_lines} lines")
-        print(f"✓ Found {self.query_traces} Query requests")
+        print(f"✓ Found {self.query_traces} Search/Query requests")
+        for operation in READ_OPERATIONS:
+            count = len(self.operation_trace_ids.get(operation, set()))
+            if count:
+                print(f"  {operation} requests: {count}")
+        if not self.query_traces and self.operation_counts:
+            operations = ", ".join(
+                f"{name}={count}" for name, count in sorted(self.operation_counts.items())
+            )
+            print(f"  Parsed operations: {operations}")
 
     def analyze(self):
-        """分析所有 Query 请求"""
-        print("\nAnalyzing Query requests...")
+        """Analyze all Search/Query requests."""
+        print("\nAnalyzing Search/Query requests...")
 
         for trace_id, events in self.events_by_trace.items():
             request = self._analyze_single_request(trace_id, events)
             self.query_requests[trace_id] = request
 
-        print(f"✓ Analyzed {len(self.query_requests)} Query requests")
+        print(f"✓ Analyzed {len(self.query_requests)} Search/Query requests")
 
     def _analyze_single_request(self, trace_id: str, events: List[dict]) -> QueryRequest:
-        """分析单个 Query 请求"""
-        request = QueryRequest(trace_id=trace_id, path=QueryPath.UNKNOWN)
+        """Analyze one Search/Query request."""
+        operation = events[0].get('operation', 'Unknown') if events else 'Unknown'
+        request = QueryRequest(
+            trace_id=trace_id,
+            path=QueryPath.UNKNOWN,
+            operation=operation,
+        )
 
         # 用于判断路径类型
         has_cache_miss = False
@@ -314,8 +338,8 @@ class QueryAnalyzer:
                     'source': event.get('source', 'unknown'),
                 })
 
-            # Segment query 执行
-            elif stage == 'segment_query':
+            # Search and Query use separate hot execution stage names.
+            elif stage in ('segment_search', 'segment_query'):
                 request.segment_query_durations.append(duration)
 
             # LoadSegment（只在 cold path 出现）
@@ -465,14 +489,14 @@ class ReportGenerator:
     def generate_console_report(self, summary: Dict):
         """生成控制台报告"""
         print("\n" + "=" * 80)
-        print("MILVUS QUERY TRACE ANALYSIS REPORT")
+        print("MILVUS SEARCH/QUERY TRACE ANALYSIS REPORT")
         print("=" * 80)
 
         total = summary['total_requests']
-        print(f"\n📊 Total Query Requests: {total}")
+        print(f"\n📊 Total Search/Query Requests: {total}")
 
         if total == 0:
-            print("\n⚠️  No Query requests found in the trace log")
+            print("\n⚠️  No Search/Query requests found in the trace log")
             return
 
         print("\n" + "-" * 80)
@@ -654,6 +678,7 @@ class ReportGenerator:
         for req in self.analyzer.query_requests.values():
             request_data.append({
                 'trace_id': req.trace_id,
+                'operation': req.operation,
                 'path': req.path.value,
                 'route_ms': req.route_ms,
                 'sealed_count': req.sealed_count,
@@ -864,7 +889,16 @@ def main():
     analyzer.load_from_file(args.logfile)
 
     if analyzer.query_traces == 0:
-        print("\n⚠️  No Query requests found in the log file")
+        print("\n⚠️  No Search/Query requests found in the log file")
+        if analyzer.operation_counts:
+            operations = ", ".join(
+                f"{name}={count}" for name, count in sorted(analyzer.operation_counts.items())
+            )
+            print(f"Parsed operations: {operations}")
+            print(
+                "This log may contain only non-read operations, or it may have "
+                "been produced by a different tracer format."
+            )
         return 1
 
     analyzer.analyze()
