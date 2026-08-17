@@ -204,7 +204,10 @@ func (loader *segmentLoaderV2) Load(ctx context.Context,
 		return nil, err
 	}
 
-	var requestResourceResult requestResourceResult
+	var (
+		err error
+		requestResourceResult requestResourceResult
+	)
 	if !isLazyLoad(collection, segmentType) {
 		// Check memory & storage limit. Lazy-load sealed segments request resource when
 		// Search/Query first touches the segment.
