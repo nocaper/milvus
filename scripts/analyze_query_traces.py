@@ -13,6 +13,7 @@ Milvus Query Trace Analysis Script - 清晰版
     python analyze_query_traces.py milvus.log
     python analyze_query_traces.py milvus.log --output ./query_report
     python analyze_query_traces.py milvus.log --format json
+    python analyze_query_traces.py milvus.log --unknown-output ./unknown_requests.log
 """
 
 import re
@@ -291,6 +292,60 @@ class QueryAnalyzer:
             self.query_requests[trace_id] = request
 
         print(f"✓ Analyzed {len(self.query_requests)} Search/Query requests")
+
+    def export_unknown_requests(self, filepath: str):
+        """Write UNKNOWN requests and their parsed events as readable text."""
+        unknown_requests = [
+            (trace_id, request)
+            for trace_id, request in self.query_requests.items()
+            if request.path == QueryPath.UNKNOWN
+        ]
+
+        output_path = Path(filepath)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with output_path.open('w', encoding='utf-8') as output:
+            output.write("UNKNOWN Search/Query requests\n")
+            output.write("=" * 100 + "\n")
+            output.write(f"total_unknown_requests={len(unknown_requests)}\n\n")
+
+            for index, (trace_id, request) in enumerate(unknown_requests, start=1):
+                events = self.events_by_trace.get(trace_id, [])
+                stages = sorted({event.get('stage', '') for event in events})
+                output.write(f"UNKNOWN_REQUEST {index}\n")
+                output.write("-" * 100 + "\n")
+                output.write(f"trace_id={trace_id}\n")
+                output.write(f"operation={request.operation}\n")
+                output.write(f"event_count={len(events)}\n")
+                output.write(f"stages={','.join(stages)}\n")
+                output.write(f"sealed_count={request.sealed_count}\n")
+                output.write(f"growing_count={request.growing_count}\n")
+                output.write("reason=no segment execution or cache-wait event was associated with this trace_id\n")
+                output.write("events:\n")
+
+                for event in events:
+                    fixed_fields = (
+                        'trace_id',
+                        'operation',
+                        'stage',
+                        'component',
+                        'duration_ms',
+                    )
+                    fields = [
+                        f"{key}={event[key]}"
+                        for key in fixed_fields
+                        if key in event
+                    ]
+                    metadata = [
+                        f"{key}={event[key]}"
+                        for key in sorted(event)
+                        if key not in fixed_fields
+                    ]
+                    output.write("  [LATENCY_TRACE] " + " ".join(fields + metadata) + "\n")
+
+                output.write("\n")
+
+        print(f"✓ Wrote {len(unknown_requests)} UNKNOWN requests to {output_path}")
 
     def _analyze_single_request(self, trace_id: str, events: List[dict]) -> QueryRequest:
         """Analyze one Search/Query request."""
@@ -881,6 +936,10 @@ def main():
     parser.add_argument('-f', '--format', choices=['console', 'csv', 'json', 'all'],
                        default='all', help='Output format (default: all)')
     parser.add_argument('--no-charts', action='store_true', help='Disable chart generation')
+    parser.add_argument(
+        '--unknown-output',
+        help='Write UNKNOWN Search/Query requests and parsed events to a plain text file',
+    )
 
     args = parser.parse_args()
 
@@ -903,6 +962,9 @@ def main():
 
     analyzer.analyze()
     summary = analyzer.generate_summary()
+
+    if args.unknown_output:
+        analyzer.export_unknown_requests(args.unknown_output)
 
     # 生成报告
     generator = ReportGenerator(analyzer, args.output)
