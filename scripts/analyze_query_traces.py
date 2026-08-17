@@ -419,15 +419,26 @@ class QueryAnalyzer:
 
     def generate_summary(self) -> Dict:
         """生成汇总统计"""
+        complete_requests = [
+            request
+            for request in self.query_requests.values()
+            if request.path != QueryPath.UNKNOWN
+        ]
+        incomplete_requests = len(self.query_requests) - len(complete_requests)
+
         summary = {
-            'total_requests': len(self.query_requests),
+            # Path statistics use only requests with a known path. Route-only
+            # requests remain observable through incomplete_requests.
+            'total_requests': len(complete_requests),
+            'observed_requests': len(self.query_requests),
+            'incomplete_requests': incomplete_requests,
             'by_path': {},
             'overall_stages': {},
         }
 
         # 按路径分类
         requests_by_path = defaultdict(list)
-        for req in self.query_requests.values():
+        for req in complete_requests:
             requests_by_path[req.path].append(req)
 
         for path, requests in requests_by_path.items():
@@ -448,7 +459,12 @@ class QueryAnalyzer:
             }
 
         count = len(requests)
-        percentage = (count / len(self.query_requests)) * 100
+        complete_request_count = sum(
+            1
+            for request in self.query_requests.values()
+            if request.path != QueryPath.UNKNOWN
+        )
+        percentage = (count / complete_request_count) * 100 if complete_request_count else 0.0
 
         # 收集各阶段的延迟
         route_durs = [r.route_ms for r in requests if r.route_ms > 0]
@@ -517,7 +533,11 @@ class QueryAnalyzer:
 
     def _calculate_overall_stages(self) -> Dict:
         """计算所有请求的各阶段统计（不分路径）"""
-        all_requests = list(self.query_requests.values())
+        all_requests = [
+            request
+            for request in self.query_requests.values()
+            if request.path != QueryPath.UNKNOWN
+        ]
 
         return {
             'route': self._make_latency_stats([r.route_ms for r in all_requests if r.route_ms > 0]),
@@ -548,10 +568,18 @@ class ReportGenerator:
         print("=" * 80)
 
         total = summary['total_requests']
-        print(f"\n📊 Total Search/Query Requests: {total}")
+        observed = summary.get('observed_requests', total)
+        incomplete = summary.get('incomplete_requests', 0)
+        print(f"\n📊 Complete Search/Query Requests: {total}")
+        print(f"   Observed requests: {observed}")
+        print(f"   Excluded incomplete requests: {incomplete}")
+        print("   Path percentages use complete requests only")
 
         if total == 0:
-            print("\n⚠️  No Search/Query requests found in the trace log")
+            if incomplete:
+                print("\n⚠️  No complete Search/Query paths found in the trace log")
+            else:
+                print("\n⚠️  No Search/Query requests found in the trace log")
             return
 
         print("\n" + "-" * 80)
