@@ -126,6 +126,17 @@ class QueryRequest:
     max_load_ms: float = 0.0
     total_load_ms: float = 0.0
 
+    # 数据获取来源分桶（请求可见时延，每请求取并发 max）
+    visible_cold_fetch_ms: float = 0.0   # 等待自己触发的物理加载
+    visible_peer_wait_ms: float = 0.0    # 等待其他请求的加载
+    visible_warm_ms: float = 0.0         # 直接命中内存的 cache 开销
+    visible_execute_ms: float = 0.0      # segment 上的实际执行
+
+    # 同样分桶，但按总工作量（跨 segment 求和）
+    work_cold_fetch_ms: float = 0.0
+    work_peer_wait_ms: float = 0.0
+    work_warm_ms: float = 0.0
+
     # 总延迟（估算）
     estimated_total_ms: float = 0.0
 
@@ -155,6 +166,28 @@ class QueryRequest:
             self.load_segment_count = len(self.load_segment_durations)
             self.max_load_ms = max(self.load_segment_durations)
             self.total_load_ms = sum(self.load_segment_durations)
+
+        # 数据获取时延按来源分桶。每个 segment 的 cache_wait 事件已经带了
+        # cache_miss / waited_for_load，直接按这两个标志归类即可。
+        # visible_*  取 max：多 segment 是并发的，请求只感知最慢的那个
+        # work_*     取 sum：反映集群实际花掉的工作量
+        cold, peer, warm = [], [], []
+        for seg in self.cache_wait_segments:
+            duration = seg['duration_ms']
+            if seg.get('cache_miss'):
+                cold.append(duration)
+            elif seg.get('waited_for_load'):
+                peer.append(duration)
+            else:
+                warm.append(duration)
+
+        self.visible_cold_fetch_ms = max(cold) if cold else 0.0
+        self.visible_peer_wait_ms = max(peer) if peer else 0.0
+        self.visible_warm_ms = max(warm) if warm else 0.0
+        self.work_cold_fetch_ms = sum(cold)
+        self.work_peer_wait_ms = sum(peer)
+        self.work_warm_ms = sum(warm)
+        self.visible_execute_ms = self.max_segment_query_ms
 
         # 估算总延迟（route + max(cache_wait, load) + max(segment_query)）
         self.estimated_total_ms = (
@@ -448,7 +481,52 @@ class QueryAnalyzer:
         # 整体阶段统计
         summary['overall_stages'] = self._calculate_overall_stages()
 
+        # 整个测试过程的时延总量，按数据来源分桶
+        summary['latency_budget'] = self._calculate_latency_budget(complete_requests)
+
         return summary
+
+    def _calculate_latency_budget(self, requests: List[QueryRequest]) -> Dict:
+        """按数据来源汇总整个测试过程的时延总量。
+
+        视角是「每个 query 请求拿到数据」：把每个请求可见的等待时延按数据
+        来源分成冷取（自己触发物理加载）、等待他人加载、热命中三桶，再跨
+        请求求和，得到整个测试过程中各来源吃掉的总时延。
+        """
+        buckets = {
+            'cold_fetch': [r.visible_cold_fetch_ms for r in requests],
+            'peer_wait': [r.visible_peer_wait_ms for r in requests],
+            'warm_hit': [r.visible_warm_ms for r in requests],
+            'execute': [r.visible_execute_ms for r in requests],
+            'route': [r.route_ms for r in requests],
+        }
+        work_buckets = {
+            'cold_fetch': sum(r.work_cold_fetch_ms for r in requests),
+            'peer_wait': sum(r.work_peer_wait_ms for r in requests),
+            'warm_hit': sum(r.work_warm_ms for r in requests),
+            'execute': sum(r.total_segment_query_ms for r in requests),
+        }
+
+        visible_grand_total = sum(sum(v) for v in buckets.values())
+        budget = {
+            'request_count': len(requests),
+            'visible_total_ms': round(visible_grand_total, 2),
+            'by_source': {},
+            'work_total_ms': {k: round(v, 2) for k, v in work_buckets.items()},
+        }
+
+        for name, values in buckets.items():
+            affected = [v for v in values if v > 0]
+            total = sum(values)
+            budget['by_source'][name] = {
+                'total_ms': round(total, 2),
+                'share_pct': round(total / visible_grand_total * 100, 2) if visible_grand_total else 0.0,
+                'affected_requests': len(affected),
+                'avg_per_affected_ms': round(total / len(affected), 2) if affected else 0.0,
+                'avg_per_request_ms': round(total / len(requests), 2) if requests else 0.0,
+            }
+
+        return budget
 
     def _calculate_path_statistics(self, requests: List[QueryRequest]) -> Dict:
         """计算特定路径的统计信息"""
@@ -668,12 +746,62 @@ class ReportGenerator:
             print(f"\n⏰ Estimated Total:")
             self._print_latency_stats(overall['estimated_total'])
 
+        self._print_latency_budget(summary)
+
         print("\n" + "=" * 80)
         print("KEY INSIGHTS")
         print("=" * 80)
         self._print_insights(summary)
 
         print("\n")
+
+    def _print_latency_budget(self, summary: Dict):
+        """打印整个测试过程按数据来源分桶的时延总量"""
+        budget = summary.get('latency_budget')
+        if not budget or not budget['request_count']:
+            return
+
+        print("\n" + "=" * 80)
+        print("LATENCY BUDGET BY DATA SOURCE (whole test run)")
+        print("=" * 80)
+        print(f"\nRequests counted: {budget['request_count']}")
+        print(f"Request-visible latency total: {budget['visible_total_ms']:.2f} ms")
+        print("Per-request values use max across concurrent segments")
+
+        labels = {
+            'cold_fetch': 'Cold fetch (own lazy-load)',
+            'peer_wait': 'Peer wait (other loader)',
+            'warm_hit': 'Warm hit (in memory)',
+            'execute': 'Segment execution',
+            'route': 'Route',
+        }
+
+        header = f"\n{'Source':<28} {'Total ms':>14} {'Share':>8} {'Reqs':>8} {'Avg/req':>10} {'Avg/affected':>14}"
+        print(header)
+        print("-" * len(header))
+        for key in ('cold_fetch', 'peer_wait', 'warm_hit', 'execute', 'route'):
+            stats = budget['by_source'][key]
+            print(
+                f"{labels[key]:<28} {stats['total_ms']:>14.2f} "
+                f"{stats['share_pct']:>7.2f}% {stats['affected_requests']:>8} "
+                f"{stats['avg_per_request_ms']:>10.2f} {stats['avg_per_affected_ms']:>14.2f}"
+            )
+
+        work = budget['work_total_ms']
+        print("\nTotal work across all segments (sum, not request-visible):")
+        for key in ('cold_fetch', 'peer_wait', 'warm_hit', 'execute'):
+            print(f"   {labels[key]:<28} {work[key]:>14.2f} ms")
+
+        cold_total = budget['by_source']['cold_fetch']['total_ms']
+        peer_total = budget['by_source']['peer_wait']['total_ms']
+        warm_total = budget['by_source']['warm_hit']['total_ms']
+        lazy_total = cold_total + peer_total
+        hot_total = warm_total + budget['by_source']['execute']['total_ms']
+        print(f"\n   Lazy-load attributable (cold + peer wait): {lazy_total:.2f} ms")
+        print(f"   Hot-path attributable (warm + execution):  {hot_total:.2f} ms")
+        if lazy_total + hot_total > 0:
+            ratio = lazy_total / (lazy_total + hot_total) * 100
+            print(f"   Lazy-load share of data-access latency:    {ratio:.2f}%")
 
     def _print_latency_stats(self, stats: Dict):
         """打印延迟统计"""
@@ -780,6 +908,25 @@ class ReportGenerator:
         requests_file = self.output_dir / 'query_requests_detail.csv'
         df_requests.to_csv(requests_file, index=False)
         print(f"  ✓ {requests_file}")
+
+        # 3. Latency budget by data source
+        budget = summary.get('latency_budget')
+        if budget and budget['request_count']:
+            budget_data = [
+                {
+                    'source': source,
+                    'total_ms': stats['total_ms'],
+                    'share_pct': stats['share_pct'],
+                    'affected_requests': stats['affected_requests'],
+                    'avg_per_request_ms': stats['avg_per_request_ms'],
+                    'avg_per_affected_ms': stats['avg_per_affected_ms'],
+                    'work_total_ms': budget['work_total_ms'].get(source, ''),
+                }
+                for source, stats in budget['by_source'].items()
+            ]
+            budget_file = self.output_dir / 'query_latency_budget.csv'
+            pd.DataFrame(budget_data).to_csv(budget_file, index=False)
+            print(f"  ✓ {budget_file}")
 
     def export_json(self, summary: Dict):
         """导出 JSON 报告"""
