@@ -501,6 +501,12 @@ func (loader *segmentLoaderV2) LoadLazySegment(ctx context.Context,
 	segment *LocalSegment,
 	loadInfo *querypb.SegmentLoadInfo,
 ) (err error) {
+	log.Ctx(ctx).Warn("lazy_load_storage_v2_unsupported",
+		zap.Int64("collectionID", segment.Collection()),
+		zap.Int64("partitionID", segment.Partition()),
+		zap.Int64("segmentID", segment.ID()),
+		zap.Int64("storageVersion", loadInfo.GetStorageVersion()),
+	)
 	return merr.ErrOperationNotSupported
 }
 
@@ -1138,6 +1144,7 @@ func (loader *segmentLoader) LoadLazySegment(ctx context.Context,
 	segment *LocalSegment,
 	loadInfo *querypb.SegmentLoadInfo,
 ) (err error) {
+	ctx = withLazyLoadTraceContext(ctx)
 	resource, err := loader.requestResourceWithTimeout(ctx, loadInfo)
 	if err != nil {
 		log.Ctx(ctx).Warn("request resource failed", zap.Error(err))

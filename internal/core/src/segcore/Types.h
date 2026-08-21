@@ -44,8 +44,10 @@ struct LoadIndexInfo {
     std::vector<std::string> index_files;
     index::IndexBasePtr index;
     std::string uri;
-    int64_t index_store_version;
+    int64_t index_store_version = 0;
     IndexVersion index_engine_version;
+    bool lazy_load = false;
+    storage::IndexLoadTraceInfoPtr index_load_trace;
 };
 
 }  // namespace milvus::segcore

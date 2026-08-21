@@ -39,6 +39,17 @@ import (
 
 var errLazyLoadTimeout = merr.WrapErrServiceInternal("lazy load time out")
 
+type lazyLoadTraceKey struct{}
+
+func withLazyLoadTraceContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, lazyLoadTraceKey{}, true)
+}
+
+func isLazyLoadTraceContext(ctx context.Context) bool {
+	lazyLoad, _ := ctx.Value(lazyLoadTraceKey{}).(bool)
+	return lazyLoad
+}
+
 func GetPkField(schema *schemapb.CollectionSchema) *schemapb.FieldSchema {
 	for _, field := range schema.GetFields() {
 		if field.GetIsPrimaryKey() {

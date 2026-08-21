@@ -205,8 +205,12 @@ SegmentGrowingImpl::LoadFieldData(const LoadFieldDataInfo& infos) {
                  this->get_segment_id(),
                  field_id.get(),
                  num_rows);
-        auto load_future =
-            pool.Submit(LoadFieldDatasFromRemote, insert_files, channel);
+        auto load_future = pool.Submit(LoadFieldDatasFromRemote,
+                                       insert_files,
+                                       channel,
+                                       false,
+                                       this->get_segment_id(),
+                                       field_id.get());
 
         LOG_INFO("segment {} submits load field {} task to thread pool",
                  this->get_segment_id(),
@@ -296,8 +300,12 @@ SegmentGrowingImpl::LoadFieldDataV2(const LoadFieldDataInfo& infos) {
             infos.url, milvus_storage::Options{nullptr, infos.storage_version});
         AssertInfo(res.ok(), "init space failed");
         std::shared_ptr<milvus_storage::Space> space = std::move(res.value());
-        auto load_future = pool.Submit(
-            LoadFieldDatasFromRemote2, space, schema_, field_data_info);
+        auto load_future = pool.Submit(LoadFieldDatasFromRemote2,
+                                       space,
+                                       schema_,
+                                       field_data_info,
+                                       false,
+                                       this->get_segment_id());
         auto field_data =
             milvus::storage::CollectFieldDataChannel(field_data_info.channel);
         if (field_id == TimestampFieldID) {

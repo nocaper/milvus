@@ -49,7 +49,8 @@ DiskFileManagerImpl::DiskFileManagerImpl(
     const FileManagerContext& fileManagerContext,
     std::shared_ptr<milvus_storage::Space> space)
     : FileManagerImpl(fileManagerContext.fieldDataMeta,
-                      fileManagerContext.indexMeta),
+                      fileManagerContext.indexMeta,
+                      fileManagerContext.indexLoadTrace),
       space_(space) {
     rcm_ = fileManagerContext.chunkManagerPtr;
 }
@@ -57,7 +58,8 @@ DiskFileManagerImpl::DiskFileManagerImpl(
 DiskFileManagerImpl::DiskFileManagerImpl(
     const FileManagerContext& fileManagerContext)
     : FileManagerImpl(fileManagerContext.fieldDataMeta,
-                      fileManagerContext.indexMeta) {
+                      fileManagerContext.indexMeta,
+                      fileManagerContext.indexLoadTrace) {
     rcm_ = fileManagerContext.chunkManagerPtr;
 }
 
@@ -316,7 +318,8 @@ DiskFileManagerImpl::CacheIndexToDisk(
             batch_remote_files.push_back(origin_file);
         }
 
-        auto index_chunks = GetObjectData(rcm_.get(), batch_remote_files);
+        auto index_chunks =
+            GetObjectData(rcm_.get(), batch_remote_files, index_load_trace_);
         for (auto& chunk : index_chunks) {
             auto index_data = chunk.get()->GetFieldData();
             auto index_size = index_data->Size();
@@ -335,7 +338,8 @@ DiskFileManagerImpl::CacheBatchIndexFilesToDisk(
     uint64_t local_file_init_offfset) {
     auto local_chunk_manager =
         LocalChunkManagerSingleton::GetInstance().GetChunkManager();
-    auto index_datas = GetObjectData(rcm_.get(), remote_files);
+    auto index_datas =
+        GetObjectData(rcm_.get(), remote_files, index_load_trace_);
     int batch_size = remote_files.size();
     AssertInfo(index_datas.size() == batch_size,
                "inconsistent file num and index data num!");
@@ -360,7 +364,8 @@ DiskFileManagerImpl::CacheBatchIndexFilesToDiskV2(
     uint64_t local_file_init_offfset) {
     auto local_chunk_manager =
         LocalChunkManagerSingleton::GetInstance().GetChunkManager();
-    auto index_datas = GetObjectData(space_, remote_files);
+    auto index_datas =
+        GetObjectData(space_, remote_files, index_load_trace_);
     int batch_size = remote_files.size();
     AssertInfo(index_datas.size() == batch_size,
                "inconsistent file num and index data num!");

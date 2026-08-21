@@ -87,11 +87,21 @@ GetSegmentRawDataPathPrefix(ChunkManagerPtr cm, int64_t segment_id);
 
 std::unique_ptr<DataCodec>
 DownloadAndDecodeRemoteFile(ChunkManager* chunk_manager,
-                            const std::string& file);
+                            const std::string& file,
+                            const IndexLoadTraceInfoPtr& index_load_trace =
+                                nullptr);
 
 std::unique_ptr<DataCodec>
 DownloadAndDecodeRemoteFileV2(std::shared_ptr<milvus_storage::Space> space,
-                              const std::string& file);
+                              const std::string& file,
+                              const IndexLoadTraceInfoPtr& index_load_trace =
+                                  nullptr);
+
+void
+LogLazyLoadIndexObjectDeserialized(const IndexLoadTraceInfoPtr& index_load_trace,
+                                   const std::string& object_path,
+                                   int64_t serialized_bytes,
+                                   const FieldDataPtr& field_data);
 
 std::pair<std::string, size_t>
 EncodeAndUploadIndexSlice(ChunkManager* chunk_manager,
@@ -118,11 +128,13 @@ EncodeAndUploadFieldSlice(ChunkManager* chunk_manager,
 
 std::vector<std::future<std::unique_ptr<DataCodec>>>
 GetObjectData(ChunkManager* remote_chunk_manager,
-              const std::vector<std::string>& remote_files);
+              const std::vector<std::string>& remote_files,
+              const IndexLoadTraceInfoPtr& index_load_trace = nullptr);
 
 std::vector<FieldDataPtr>
 GetObjectData(std::shared_ptr<milvus_storage::Space> space,
-              const std::vector<std::string>& remote_files);
+              const std::vector<std::string>& remote_files,
+              const IndexLoadTraceInfoPtr& index_load_trace = nullptr);
 
 std::map<std::string, int64_t>
 PutIndexData(ChunkManager* remote_chunk_manager,

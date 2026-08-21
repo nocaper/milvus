@@ -84,5 +84,10 @@ struct FieldDataInfo {
     size_t row_count;
     std::string mmap_dir_path;
     FieldDataChannelPtr channel;
+    bool lazy_load = false;
+    std::vector<std::string> storage_objects;
+    std::vector<int64_t> storage_entries;
+    std::string storage_uri;
+    int64_t storage_version = 0;
 };
 }  // namespace milvus

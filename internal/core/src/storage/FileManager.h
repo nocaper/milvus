@@ -19,6 +19,7 @@
 #include <string>
 #include <optional>
 #include <memory>
+#include <utility>
 
 #include "common/Consts.h"
 #include "knowhere/file_manager.h"
@@ -34,20 +35,24 @@ struct FileManagerContext {
     }
     FileManagerContext(const FieldDataMeta& fieldDataMeta,
                        const IndexMeta& indexMeta,
-                       const ChunkManagerPtr& chunkManagerPtr)
+                       const ChunkManagerPtr& chunkManagerPtr,
+                       IndexLoadTraceInfoPtr indexLoadTrace = nullptr)
         : fieldDataMeta(fieldDataMeta),
           indexMeta(indexMeta),
-          chunkManagerPtr(chunkManagerPtr) {
+          chunkManagerPtr(chunkManagerPtr),
+          indexLoadTrace(std::move(indexLoadTrace)) {
     }
 
     FileManagerContext(const FieldDataMeta& fieldDataMeta,
                        const IndexMeta& indexMeta,
                        const ChunkManagerPtr& chunkManagerPtr,
-                       std::shared_ptr<milvus_storage::Space> space)
+                       std::shared_ptr<milvus_storage::Space> space,
+                       IndexLoadTraceInfoPtr indexLoadTrace = nullptr)
         : fieldDataMeta(fieldDataMeta),
           indexMeta(indexMeta),
           chunkManagerPtr(chunkManagerPtr),
-          space_(space) {
+          space_(space),
+          indexLoadTrace(std::move(indexLoadTrace)) {
     }
     bool
     Valid() const {
@@ -58,6 +63,7 @@ struct FileManagerContext {
     IndexMeta indexMeta;
     ChunkManagerPtr chunkManagerPtr;
     std::shared_ptr<milvus_storage::Space> space_;
+    IndexLoadTraceInfoPtr indexLoadTrace;
 };
 
 #define FILEMANAGER_TRY try {
@@ -75,8 +81,11 @@ struct FileManagerContext {
 class FileManagerImpl : public knowhere::FileManager {
  public:
     explicit FileManagerImpl(const FieldDataMeta& field_mata,
-                             IndexMeta index_meta)
-        : field_meta_(field_mata), index_meta_(std::move(index_meta)) {
+                             IndexMeta index_meta,
+                             IndexLoadTraceInfoPtr index_load_trace = nullptr)
+        : field_meta_(field_mata),
+          index_meta_(std::move(index_meta)),
+          index_load_trace_(std::move(index_load_trace)) {
     }
 
  public:
@@ -130,6 +139,11 @@ class FileManagerImpl : public knowhere::FileManager {
         return index_meta_;
     }
 
+    IndexLoadTraceInfoPtr
+    GetIndexLoadTrace() const {
+        return index_load_trace_;
+    }
+
     virtual std::string
     GetRemoteIndexObjectPrefix() const {
         return rcm_->GetRootPath() + "/" + std::string(INDEX_ROOT_PATH) + "/" +
@@ -155,6 +169,7 @@ class FileManagerImpl : public knowhere::FileManager {
     // index meta
     IndexMeta index_meta_;
     ChunkManagerPtr rcm_;
+    IndexLoadTraceInfoPtr index_load_trace_;
 };
 
 using FileManagerImplPtr = std::shared_ptr<FileManagerImpl>;

@@ -291,6 +291,11 @@ ScalarIndexSort<T>::LoadV2(const Config& config) {
         }
         auto raw_index_blob =
             storage::DeserializeFileData(index_blob_data, res.value());
+        storage::LogLazyLoadIndexObjectDeserialized(
+            file_manager_->GetIndexLoadTrace(),
+            file_name,
+            res.value(),
+            raw_index_blob->GetFieldData());
         auto key = file_name.substr(file_name.find_last_of('/') + 1);
         index_datas[key] = raw_index_blob->GetFieldData();
     }

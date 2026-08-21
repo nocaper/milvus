@@ -896,6 +896,7 @@ func (s *LocalSegment) LoadMultiFieldData(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	loadFieldDataInfo.setLazyLoad(isLazyLoadTraceContext(ctx))
 
 	for _, field := range fields {
 		fieldID := field.FieldID
@@ -967,6 +968,7 @@ func (s *LocalSegment) LoadFieldData(ctx context.Context, fieldID int64, rowCoun
 	if err != nil {
 		return err
 	}
+	loadFieldDataInfo.setLazyLoad(isLazyLoadTraceContext(ctx))
 
 	err = loadFieldDataInfo.appendLoadFieldInfo(ctx, fieldID, rowCount)
 	if err != nil {
@@ -1261,6 +1263,7 @@ func (s *LocalSegment) LoadIndex(ctx context.Context, indexInfo *querypb.FieldIn
 	if err != nil {
 		return err
 	}
+	loadIndexInfo.setLazyLoad(isLazyLoadTraceContext(ctx))
 	defer deleteLoadIndexInfo(loadIndexInfo)
 	if paramtable.Get().CommonCfg.EnableStorageV2.GetAsBool() {
 		uri, err := typeutil_internal.GetStorageURI(paramtable.Get().CommonCfg.StorageScheme.GetValue(), paramtable.Get().CommonCfg.StoragePathPrefix.GetValue(), s.ID())

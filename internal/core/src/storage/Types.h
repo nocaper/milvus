@@ -16,7 +16,10 @@
 
 #pragma once
 
+#include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "common/Types.h"
 
@@ -83,6 +86,30 @@ struct IndexMeta {
     DataType field_type;
     int64_t dim;
 };
+
+// Carries lazy-load index tracing metadata through the index file managers.
+// The file managers may deserialize index objects concurrently.
+struct IndexLoadTraceInfo {
+    bool lazy_load = false;
+    int64_t segment_id = 0;
+    int64_t field_id = 0;
+    int64_t index_id = 0;
+    int64_t index_build_id = 0;
+    int64_t index_version = 0;
+    int64_t storage_version = 0;
+    bool mmap_requested = false;
+    bool mmap_enabled = false;
+    std::string index_type;
+    std::string storage_uri;
+
+    std::mutex mutex;
+    int64_t serialized_bytes = 0;
+    int64_t deserialized_bytes = 0;
+    int64_t object_count = 0;
+    std::vector<std::string> storage_objects;
+};
+
+using IndexLoadTraceInfoPtr = std::shared_ptr<IndexLoadTraceInfo>;
 
 struct StorageConfig {
     std::string address = "localhost:9000";

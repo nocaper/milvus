@@ -63,6 +63,13 @@ func newLoadIndexInfo(ctx context.Context) (*LoadIndexInfo, error) {
 	return &LoadIndexInfo{cLoadIndexInfo: cLoadIndexInfo}, nil
 }
 
+func (li *LoadIndexInfo) setLazyLoad(lazyLoad bool) {
+	GetDynamicPool().Submit(func() (any, error) {
+		C.SetIndexLazyLoad(li.cLoadIndexInfo, C.bool(lazyLoad))
+		return nil, nil
+	}).Await()
+}
+
 // deleteLoadIndexInfo would delete C.CLoadIndexInfo
 func deleteLoadIndexInfo(info *LoadIndexInfo) {
 	GetDynamicPool().Submit(func() (any, error) {

@@ -70,6 +70,9 @@ AppendIndexEngineVersionToLoadInfo(CLoadIndexInfo c_load_index_info,
                                    int32_t index_engine_version);
 
 CStatus
+SetIndexLazyLoad(CLoadIndexInfo c_load_index_info, bool lazy_load);
+
+CStatus
 CleanLoadedIndex(CLoadIndexInfo c_load_index_info);
 
 void

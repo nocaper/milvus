@@ -333,6 +333,11 @@ StringIndexMarisa::LoadV2(const Config& config) {
         }
         auto raw_index_blob =
             storage::DeserializeFileData(index_blob_data, res.value());
+        storage::LogLazyLoadIndexObjectDeserialized(
+            file_manager_->GetIndexLoadTrace(),
+            file_name,
+            res.value(),
+            raw_index_blob->GetFieldData());
         index_datas[file_name] = raw_index_blob->GetFieldData();
     }
     AssembleIndexDatas(index_datas);

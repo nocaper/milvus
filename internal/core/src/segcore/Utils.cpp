@@ -13,6 +13,7 @@
 
 #include <future>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -762,9 +763,38 @@ ReverseDataFromIndex(const index::IndexBase* index,
     return data_array;
 }
 void
+LogLazyLoadStorageObjectDeserialized(int64_t segment_id,
+                                     int64_t field_id,
+                                     const std::string& object_path,
+                                     const std::string& storage_uri,
+                                     int64_t storage_version,
+                                     int64_t serialized_bytes,
+                                     const FieldDataPtr& field_data) {
+    nlohmann::json trace = {
+        {"event", "lazy_load_storage_object_deserialized"},
+        {"data_source", "raw"},
+        {"object_kind", "field_data"},
+        {"segment_id", segment_id},
+        {"field_id", field_id},
+        {"object_path", object_path},
+        {"storage_uri", storage_uri},
+        {"storage_version", storage_version},
+        {"serialized_bytes", serialized_bytes},
+        {"deserialized_bytes", field_data->Size()},
+        {"deserialized_rows", field_data->get_num_rows()},
+        {"deserialized_length", field_data->Length()},
+        {"deserialized_dim", field_data->get_dim()},
+        {"data_type", GetDataTypeName(field_data->get_data_type())},
+    };
+    LOG_INFO("{}", trace.dump());
+}
+
+void
 LoadFieldDatasFromRemote2(std::shared_ptr<milvus_storage::Space> space,
                           SchemaPtr schema,
-                          FieldDataInfo& field_data_info) {
+                          FieldDataInfo& field_data_info,
+                          bool trace_lazy_load,
+                          int64_t segment_id) {
     auto reader = space->ScanData();
 
     for (auto rec = reader->Next(); rec != nullptr; rec = reader->Next()) {
@@ -779,11 +809,24 @@ LoadFieldDatasFromRemote2(std::shared_ptr<milvus_storage::Space> space,
             }
             auto col_data =
                 data->GetColumnByName(field.second.get_name().get());
+            auto data_type = field.second.get_data_type();
+            auto dim = field.second.is_vector() &&
+                               !IsSparseFloatVectorDataType(data_type)
+                           ? field.second.get_dim()
+                           : 0;
             auto field_data = storage::CreateFieldData(
-                field.second.get_data_type(),
-                field.second.is_vector() ? field.second.get_dim() : 0,
-                total_num_rows);
+                data_type, dim, total_num_rows);
             field_data->FillFieldData(col_data);
+            if (trace_lazy_load) {
+                LogLazyLoadStorageObjectDeserialized(
+                    segment_id,
+                    field_data_info.field_id,
+                    "",
+                    field_data_info.storage_uri,
+                    field_data_info.storage_version,
+                    -1,
+                    field_data);
+            }
             field_data_info.channel->push(field_data);
         }
     }
@@ -793,7 +836,10 @@ LoadFieldDatasFromRemote2(std::shared_ptr<milvus_storage::Space> space,
 // segcore use default remote chunk manager to load data from minio/s3
 void
 LoadFieldDatasFromRemote(const std::vector<std::string>& remote_files,
-                         FieldDataChannelPtr channel) {
+                         FieldDataChannelPtr channel,
+                         bool trace_lazy_load,
+                         int64_t segment_id,
+                         int64_t field_id) {
     try {
         auto rcm = storage::RemoteChunkManagerSingleton::GetInstance()
                        .GetRemoteChunkManager();
@@ -802,12 +848,22 @@ LoadFieldDatasFromRemote(const std::vector<std::string>& remote_files,
         std::vector<std::future<FieldDataPtr>> futures;
         futures.reserve(remote_files.size());
         for (const auto& file : remote_files) {
-            auto future = pool.Submit([&]() {
+            auto future = pool.Submit([&, file]() {
                 auto fileSize = rcm->Size(file);
                 auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize]);
                 rcm->Read(file, buf.get(), fileSize);
                 auto result = storage::DeserializeFileData(buf, fileSize);
-                return result->GetFieldData();
+                auto field_data = result->GetFieldData();
+                if (trace_lazy_load) {
+                    LogLazyLoadStorageObjectDeserialized(segment_id,
+                                                         field_id,
+                                                         file,
+                                                         "",
+                                                         0,
+                                                         fileSize,
+                                                         field_data);
+                }
+                return field_data;
             });
             futures.emplace_back(std::move(future));
         }

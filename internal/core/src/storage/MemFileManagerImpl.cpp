@@ -30,7 +30,8 @@ MemFileManagerImpl::MemFileManagerImpl(
     const FileManagerContext& fileManagerContext,
     std::shared_ptr<milvus_storage::Space> space)
     : FileManagerImpl(fileManagerContext.fieldDataMeta,
-                      fileManagerContext.indexMeta),
+                      fileManagerContext.indexMeta,
+                      fileManagerContext.indexLoadTrace),
       space_(space) {
     rcm_ = fileManagerContext.chunkManagerPtr;
 }
@@ -38,7 +39,8 @@ MemFileManagerImpl::MemFileManagerImpl(
 MemFileManagerImpl::MemFileManagerImpl(
     const FileManagerContext& fileManagerContext)
     : FileManagerImpl(fileManagerContext.fieldDataMeta,
-                      fileManagerContext.indexMeta) {
+                      fileManagerContext.indexMeta,
+                      fileManagerContext.indexLoadTrace) {
     rcm_ = fileManagerContext.chunkManagerPtr;
 }
 
@@ -149,7 +151,8 @@ MemFileManagerImpl::LoadIndexToMemory(
     std::vector<std::string> batch_files;
 
     auto LoadBatchIndexFiles = [&]() {
-        auto index_datas = GetObjectData(rcm_.get(), batch_files);
+        auto index_datas =
+            GetObjectData(rcm_.get(), batch_files, index_load_trace_);
         for (size_t idx = 0; idx < batch_files.size(); ++idx) {
             auto file_name =
                 batch_files[idx].substr(batch_files[idx].find_last_of('/') + 1);

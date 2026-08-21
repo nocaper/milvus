@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -67,18 +69,117 @@ get_bit(const BitsetType& bitset, FieldId field_id) {
     return bitset[pos];
 }
 
+static int64_t
+sum_entries(const std::vector<int64_t>& entries) {
+    int64_t total = 0;
+    for (auto entry : entries) {
+        total += entry;
+    }
+    return total;
+}
+
+static void
+log_lazy_load_segment_length(int64_t segment_id,
+                             const FieldId field_id,
+                             const FieldMeta& field_meta,
+                             const FieldDataInfo& data,
+                             const std::string& load_mode,
+                             int64_t chunk_count,
+                             int64_t deserialized_rows,
+                             int64_t deserialized_bytes,
+                             size_t loaded_rows,
+                             size_t column_bytes) {
+    if (!data.lazy_load) {
+        return;
+    }
+
+    auto segment_length_bytes =
+        column_bytes > 0 ? static_cast<int64_t>(column_bytes)
+                         : deserialized_bytes;
+    nlohmann::json trace = {
+        {"event", "lazy_load_segment_length"},
+        {"segment_id", segment_id},
+        {"field_id", field_id.get()},
+        {"field_name", field_meta.get_name().get()},
+        {"data_type", GetDataTypeName(field_meta.get_data_type())},
+        {"dim",
+         field_meta.is_vector() &&
+                 !IsSparseFloatVectorDataType(field_meta.get_data_type())
+             ? field_meta.get_dim()
+             : 0},
+        {"expected_rows", data.row_count},
+        {"loaded_rows", loaded_rows},
+        {"chunk_count", chunk_count},
+        {"deserialized_rows", deserialized_rows},
+        {"deserialized_bytes", deserialized_bytes},
+        {"column_bytes", column_bytes},
+        {"segment_length_bytes", segment_length_bytes},
+        {"load_mode", load_mode},
+        {"mmap", load_mode == "mmap"},
+        {"storage_object_count", data.storage_objects.size()},
+        {"storage_entries_total", sum_entries(data.storage_entries)},
+        {"storage_objects", data.storage_objects},
+        {"storage_uri", data.storage_uri},
+        {"storage_version", data.storage_version},
+    };
+    LOG_INFO("{}", trace.dump());
+}
+
+static void
+log_lazy_load_index_length(const LoadIndexInfo& info,
+                           const FieldMeta& field_meta,
+                           int64_t row_count) {
+    auto trace_info = info.index_load_trace;
+    if (!info.lazy_load || trace_info == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(trace_info->mutex);
+    nlohmann::json trace = {
+        {"event", "lazy_load_index_length"},
+        {"data_source", "index"},
+        {"segment_id", info.segment_id},
+        {"field_id", info.field_id},
+        {"field_name", field_meta.get_name().get()},
+        {"data_type", GetDataTypeName(field_meta.get_data_type())},
+        {"dim", field_meta.is_vector() &&
+                         !IsSparseFloatVectorDataType(field_meta.get_data_type())
+                     ? field_meta.get_dim()
+                     : 0},
+        {"expected_rows", row_count},
+        {"loaded_rows", row_count},
+        {"index_id", info.index_id},
+        {"index_build_id", info.index_build_id},
+        {"index_version", info.index_version},
+        {"index_type", trace_info->index_type},
+        {"serialized_bytes", trace_info->serialized_bytes},
+        {"deserialized_bytes", trace_info->deserialized_bytes},
+        {"index_length_bytes", trace_info->deserialized_bytes},
+        {"storage_object_count", trace_info->object_count},
+        {"storage_objects", trace_info->storage_objects},
+        {"storage_uri", info.uri},
+        {"storage_version", info.index_store_version},
+        {"load_mode", trace_info->mmap_enabled ? "mmap" : "memory"},
+        {"mmap", trace_info->mmap_enabled},
+        {"mmap_requested", trace_info->mmap_requested},
+    };
+    LOG_INFO("{}", trace.dump());
+}
+
 void
 SegmentSealedImpl::LoadIndex(const LoadIndexInfo& info) {
     // print(info);
     // NOTE: lock only when data is ready to avoid starvation
     auto field_id = FieldId(info.field_id);
     auto& field_meta = schema_->operator[](field_id);
+    auto row_count = info.index->Count();
 
     if (field_meta.is_vector()) {
         LoadVecIndex(info);
     } else {
         LoadScalarIndex(info);
     }
+    log_lazy_load_index_length(info, field_meta, row_count);
 }
 
 void
@@ -250,6 +351,11 @@ SegmentSealedImpl::LoadFieldData(const LoadFieldDataInfo& load_info) {
 
         auto field_data_info =
             FieldDataInfo(field_id.get(), num_rows, load_info.mmap_dir_path);
+        field_data_info.lazy_load = load_info.lazy_load;
+        field_data_info.storage_objects = insert_files;
+        field_data_info.storage_entries = info.entries_nums;
+        field_data_info.storage_uri = load_info.url;
+        field_data_info.storage_version = load_info.storage_version;
         LOG_INFO("segment {} loads field {} with num_rows {}",
                  this->get_segment_id(),
                  field_id.get(),
@@ -261,7 +367,12 @@ SegmentSealedImpl::LoadFieldData(const LoadFieldDataInfo& load_info) {
         auto& pool =
             ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
         pool.Submit(
-            LoadFieldDatasFromRemote, insert_files, field_data_info.channel);
+            LoadFieldDatasFromRemote,
+            insert_files,
+            field_data_info.channel,
+            load_info.lazy_load,
+            this->get_segment_id(),
+            field_id.get());
 
         LOG_INFO("segment {} submits load field {} task to thread pool",
                  this->get_segment_id(),
@@ -292,6 +403,11 @@ SegmentSealedImpl::LoadFieldDataV2(const LoadFieldDataInfo& load_info) {
         auto insert_files = info.insert_files;
         auto field_data_info =
             FieldDataInfo(field_id.get(), num_rows, load_info.mmap_dir_path);
+        field_data_info.lazy_load = load_info.lazy_load;
+        field_data_info.storage_objects = insert_files;
+        field_data_info.storage_entries = info.entries_nums;
+        field_data_info.storage_uri = load_info.url;
+        field_data_info.storage_version = load_info.storage_version;
 
         LOG_INFO("segment {} loads field {} with num_rows {}",
                  this->get_segment_id(),
@@ -314,8 +430,12 @@ SegmentSealedImpl::LoadFieldDataV2(const LoadFieldDataInfo& load_info) {
                                load_info.url,
                                res.status().ToString()));
         std::shared_ptr<milvus_storage::Space> space = std::move(res.value());
-        auto load_future = pool.Submit(
-            LoadFieldDatasFromRemote2, space, schema_, field_data_info);
+        auto load_future = pool.Submit(LoadFieldDatasFromRemote2,
+                                       space,
+                                       schema_,
+                                       field_data_info,
+                                       load_info.lazy_load,
+                                       this->get_segment_id());
         LOG_INFO("segment {} submits load field {} task to thread pool",
                  this->get_segment_id(),
                  field_id.get());
@@ -375,6 +495,9 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
         // prepare data
         auto& field_meta = (*schema_)[field_id];
         auto data_type = field_meta.get_data_type();
+        int64_t deserialized_bytes = 0;
+        int64_t deserialized_rows = 0;
+        int64_t chunk_count = 0;
 
         // Don't allow raw data and index exist at the same time
         //        AssertInfo(!get_bit(index_ready_bitset_, field_id),
@@ -391,6 +514,9 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                             num_rows, field_meta);
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
+                        ++chunk_count;
+                        deserialized_rows += field_data->Length();
+                        deserialized_bytes += field_data->Size();
                         var_column->Append(std::move(field_data));
                     }
                     var_column->Seal();
@@ -406,6 +532,9 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                             num_rows, field_meta);
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
+                        ++chunk_count;
+                        deserialized_rows += field_data->Length();
+                        deserialized_bytes += field_data->Size();
                         var_column->Append(std::move(field_data));
                     }
                     var_column->Seal();
@@ -419,6 +548,9 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                         std::make_shared<ArrayColumn>(num_rows, field_meta);
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
+                        ++chunk_count;
+                        deserialized_rows += field_data->Length();
+                        deserialized_bytes += field_data->Size();
                         for (auto i = 0; i < field_data->get_num_rows(); i++) {
                             auto rawValue = field_data->RawValue(i);
                             auto array =
@@ -440,6 +572,9 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                     auto col = std::make_shared<SparseFloatColumn>(field_meta);
                     FieldDataPtr field_data;
                     while (data.channel->pop(field_data)) {
+                        ++chunk_count;
+                        deserialized_rows += field_data->Length();
+                        deserialized_bytes += field_data->Size();
                         stats_.mem_size += field_data->Size();
                         col->AppendBatch(field_data);
                     }
@@ -459,6 +594,9 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
             column = std::make_shared<Column>(num_rows, field_meta);
             FieldDataPtr field_data;
             while (data.channel->pop(field_data)) {
+                ++chunk_count;
+                deserialized_rows += field_data->Length();
+                deserialized_bytes += field_data->Size();
                 column->AppendBatch(field_data);
 
                 stats_.mem_size += field_data->Size();
@@ -473,6 +611,17 @@ SegmentSealedImpl::LoadFieldData(FieldId field_id, FieldDataInfo& data) {
                                data.field_id,
                                column->NumRows(),
                                num_rows));
+
+        log_lazy_load_segment_length(this->get_segment_id(),
+                                     field_id,
+                                     field_meta,
+                                     data,
+                                     "memory",
+                                     chunk_count,
+                                     deserialized_rows,
+                                     deserialized_bytes,
+                                     column->NumRows(),
+                                     column->ByteSize());
 
         {
             std::unique_lock lck(mutex_);
@@ -530,7 +679,13 @@ SegmentSealedImpl::MapFieldData(const FieldId field_id, FieldDataInfo& data) {
     std::vector<std::vector<uint64_t>> element_indices{};
     FieldDataPtr field_data;
     size_t total_written = 0;
+    int64_t deserialized_bytes = 0;
+    int64_t deserialized_rows = 0;
+    int64_t chunk_count = 0;
     while (data.channel->pop(field_data)) {
+        ++chunk_count;
+        deserialized_rows += field_data->Length();
+        deserialized_bytes += field_data->Size();
         auto written =
             WriteFieldData(file, data_type, field_data, element_indices);
 
@@ -592,6 +747,17 @@ SegmentSealedImpl::MapFieldData(const FieldId field_id, FieldDataInfo& data) {
     } else {
         column = std::make_shared<Column>(file, total_written, field_meta);
     }
+
+    log_lazy_load_segment_length(this->get_segment_id(),
+                                 field_id,
+                                 field_meta,
+                                 data,
+                                 "mmap",
+                                 chunk_count,
+                                 deserialized_rows,
+                                 deserialized_bytes,
+                                 deserialized_rows,
+                                 column->ByteSize());
 
     {
         std::unique_lock lck(mutex_);

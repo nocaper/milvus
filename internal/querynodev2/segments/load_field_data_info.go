@@ -119,3 +119,10 @@ func (ld *LoadFieldDataInfo) appendStorageVersion(version int64) {
 		return nil, nil
 	}).Await()
 }
+
+func (ld *LoadFieldDataInfo) setLazyLoad(lazyLoad bool) {
+	GetDynamicPool().Submit(func() (any, error) {
+		C.SetLazyLoad(ld.cLoadFieldDataInfo, C.bool(lazyLoad))
+		return nil, nil
+	}).Await()
+}

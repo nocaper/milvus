@@ -26,6 +26,7 @@
 #include "common/EasyAssert.h"
 #include "common/FieldData.h"
 #include "common/FieldDataInterface.h"
+#include "common/Slice.h"
 #ifdef AZURE_BUILD_DIR
 #include "storage/AzureChunkManager.h"
 #endif
@@ -40,6 +41,8 @@
 #endif
 #include "storage/Types.h"
 #include "storage/Util.h"
+
+#include <nlohmann/json.hpp>
 #include "storage/ThreadPools.h"
 #include "storage/MemFileManagerImpl.h"
 #include "storage/DiskFileManagerImpl.h"
@@ -468,17 +471,25 @@ GetSegmentRawDataPathPrefix(ChunkManagerPtr cm, int64_t segment_id) {
 
 std::unique_ptr<DataCodec>
 DownloadAndDecodeRemoteFile(ChunkManager* chunk_manager,
-                            const std::string& file) {
+                            const std::string& file,
+                            const IndexLoadTraceInfoPtr& index_load_trace) {
     auto fileSize = chunk_manager->Size(file);
     auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize]);
     chunk_manager->Read(file, buf.get(), fileSize);
 
-    return DeserializeFileData(buf, fileSize);
+    auto result = DeserializeFileData(buf, fileSize);
+    if (index_load_trace != nullptr && index_load_trace->lazy_load) {
+        auto field_data = result->GetFieldData();
+        LogLazyLoadIndexObjectDeserialized(
+            index_load_trace, file, fileSize, field_data);
+    }
+    return result;
 }
 
 std::unique_ptr<DataCodec>
 DownloadAndDecodeRemoteFileV2(std::shared_ptr<milvus_storage::Space> space,
-                              const std::string& file) {
+                              const std::string& file,
+                              const IndexLoadTraceInfoPtr& index_load_trace) {
     auto fileSize = space->GetBlobByteSize(file);
     if (!fileSize.ok()) {
         PanicInfo(FileReadFailed, fileSize.status().ToString());
@@ -489,7 +500,57 @@ DownloadAndDecodeRemoteFileV2(std::shared_ptr<milvus_storage::Space> space,
         PanicInfo(FileReadFailed, status.ToString());
     }
 
-    return DeserializeFileData(buf, fileSize.value());
+    auto result = DeserializeFileData(buf, fileSize.value());
+    if (index_load_trace != nullptr && index_load_trace->lazy_load) {
+        auto field_data = result->GetFieldData();
+        LogLazyLoadIndexObjectDeserialized(
+            index_load_trace, file, fileSize.value(), field_data);
+    }
+    return result;
+}
+
+void
+LogLazyLoadIndexObjectDeserialized(
+    const IndexLoadTraceInfoPtr& index_load_trace,
+    const std::string& object_path,
+    int64_t serialized_bytes,
+    const FieldDataPtr& field_data) {
+    if (index_load_trace == nullptr || !index_load_trace->lazy_load) {
+        return;
+    }
+
+    auto object_name = object_path.substr(object_path.find_last_of('/') + 1);
+    auto is_index_data = object_name != INDEX_FILE_SLICE_META;
+    if (is_index_data) {
+        std::lock_guard<std::mutex> lock(index_load_trace->mutex);
+        index_load_trace->serialized_bytes += serialized_bytes;
+        index_load_trace->deserialized_bytes += field_data->Size();
+        ++index_load_trace->object_count;
+        index_load_trace->storage_objects.emplace_back(object_path);
+    }
+
+    nlohmann::json trace = {
+        {"event", "lazy_load_storage_object_deserialized"},
+        {"data_source", is_index_data ? "index" : "index_metadata"},
+        {"object_kind", is_index_data ? "index_data" : "slice_meta"},
+        {"included_in_index_length", is_index_data},
+        {"segment_id", index_load_trace->segment_id},
+        {"field_id", index_load_trace->field_id},
+        {"index_id", index_load_trace->index_id},
+        {"index_build_id", index_load_trace->index_build_id},
+        {"index_version", index_load_trace->index_version},
+        {"index_type", index_load_trace->index_type},
+        {"object_path", object_path},
+        {"storage_uri", index_load_trace->storage_uri},
+        {"storage_version", index_load_trace->storage_version},
+        {"serialized_bytes", serialized_bytes},
+        {"deserialized_bytes", field_data->Size()},
+        {"deserialized_rows", field_data->get_num_rows()},
+        {"deserialized_length", field_data->Length()},
+        {"deserialized_dim", field_data->get_dim()},
+        {"data_type", GetDataTypeName(field_data->get_data_type())},
+    };
+    LOG_INFO("{}", trace.dump());
 }
 
 std::pair<std::string, size_t>
@@ -556,25 +617,31 @@ EncodeAndUploadFieldSlice(ChunkManager* chunk_manager,
 
 std::vector<std::future<std::unique_ptr<DataCodec>>>
 GetObjectData(ChunkManager* remote_chunk_manager,
-              const std::vector<std::string>& remote_files) {
+              const std::vector<std::string>& remote_files,
+              const IndexLoadTraceInfoPtr& index_load_trace) {
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::HIGH);
     std::vector<std::future<std::unique_ptr<DataCodec>>> futures;
     futures.reserve(remote_files.size());
     for (auto& file : remote_files) {
         futures.emplace_back(pool.Submit(
-            DownloadAndDecodeRemoteFile, remote_chunk_manager, file));
+            DownloadAndDecodeRemoteFile,
+            remote_chunk_manager,
+            file,
+            index_load_trace));
     }
     return futures;
 }
 
 std::vector<FieldDataPtr>
 GetObjectData(std::shared_ptr<milvus_storage::Space> space,
-              const std::vector<std::string>& remote_files) {
+              const std::vector<std::string>& remote_files,
+              const IndexLoadTraceInfoPtr& index_load_trace) {
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::HIGH);
     std::vector<std::future<std::unique_ptr<DataCodec>>> futures;
     for (auto& file : remote_files) {
         futures.emplace_back(
-            pool.Submit(DownloadAndDecodeRemoteFileV2, space, file));
+            pool.Submit(
+                DownloadAndDecodeRemoteFileV2, space, file, index_load_trace));
     }
 
     std::vector<FieldDataPtr> datas;

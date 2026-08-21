@@ -253,6 +253,22 @@ AppendIndexV2(CTraceContext c_trace, CLoadIndexInfo c_load_index_info) {
             index_info.metric_type = index_params.at("metric_type");
         }
 
+        if (load_index_info->lazy_load) {
+            load_index_info->index_load_trace =
+                std::make_shared<milvus::storage::IndexLoadTraceInfo>();
+            auto& trace = load_index_info->index_load_trace;
+            trace->lazy_load = true;
+            trace->segment_id = load_index_info->segment_id;
+            trace->field_id = load_index_info->field_id;
+            trace->index_id = load_index_info->index_id;
+            trace->index_build_id = load_index_info->index_build_id;
+            trace->index_version = load_index_info->index_version;
+            trace->storage_version = load_index_info->index_store_version;
+            trace->mmap_requested = load_index_info->enable_mmap;
+            trace->index_type = index_info.index_type;
+            trace->storage_uri = load_index_info->uri;
+        }
+
         // init file manager
         milvus::storage::FieldDataMeta field_meta{
             load_index_info->collection_id,
@@ -272,7 +288,10 @@ AppendIndexV2(CTraceContext c_trace, CLoadIndexInfo c_load_index_info) {
         config["index_files"] = load_index_info->index_files;
 
         milvus::storage::FileManagerContext fileManagerContext(
-            field_meta, index_meta, remote_chunk_manager);
+            field_meta,
+            index_meta,
+            remote_chunk_manager,
+            load_index_info->index_load_trace);
         load_index_info->index =
             milvus::index::IndexFactory::GetInstance().CreateIndex(
                 index_info, fileManagerContext);
@@ -288,6 +307,10 @@ AppendIndexV2(CTraceContext c_trace, CLoadIndexInfo c_load_index_info) {
                 std::to_string(load_index_info->index_id);
 
             config[kMmapFilepath] = filepath.string();
+        }
+        if (load_index_info->index_load_trace != nullptr) {
+            load_index_info->index_load_trace->mmap_enabled =
+                config.contains(kMmapFilepath);
         }
 
         load_index_info->index->Load(ctx, config);
@@ -339,6 +362,22 @@ AppendIndexV3(CLoadIndexInfo c_load_index_info) {
             index_info.metric_type = index_params.at("metric_type");
         }
 
+        if (load_index_info->lazy_load) {
+            load_index_info->index_load_trace =
+                std::make_shared<milvus::storage::IndexLoadTraceInfo>();
+            auto& trace = load_index_info->index_load_trace;
+            trace->lazy_load = true;
+            trace->segment_id = load_index_info->segment_id;
+            trace->field_id = load_index_info->field_id;
+            trace->index_id = load_index_info->index_id;
+            trace->index_build_id = load_index_info->index_build_id;
+            trace->index_version = load_index_info->index_version;
+            trace->storage_version = load_index_info->index_store_version;
+            trace->mmap_requested = load_index_info->enable_mmap;
+            trace->index_type = index_info.index_type;
+            trace->storage_uri = load_index_info->uri;
+        }
+
         milvus::storage::FieldDataMeta field_meta{
             load_index_info->collection_id,
             load_index_info->partition_id,
@@ -359,7 +398,11 @@ AppendIndexV3(CLoadIndexInfo c_load_index_info) {
         std::shared_ptr<milvus_storage::Space> space = std::move(res.value());
 
         milvus::storage::FileManagerContext fileManagerContext(
-            field_meta, index_meta, nullptr, space);
+            field_meta,
+            index_meta,
+            nullptr,
+            space,
+            load_index_info->index_load_trace);
         load_index_info->index =
             milvus::index::IndexFactory::GetInstance().CreateIndex(
                 index_info, fileManagerContext, space);
@@ -373,6 +416,10 @@ AppendIndexV3(CLoadIndexInfo c_load_index_info) {
                 std::to_string(load_index_info->index_id);
 
             config[kMmapFilepath] = filepath.string();
+        }
+        if (load_index_info->index_load_trace != nullptr) {
+            load_index_info->index_load_trace->mmap_enabled =
+                config.contains(kMmapFilepath);
         }
 
         load_index_info->index->LoadV2(config);
@@ -438,6 +485,25 @@ AppendIndexEngineVersionToLoadInfo(CLoadIndexInfo c_load_index_info,
         auto load_index_info =
             (milvus::segcore::LoadIndexInfo*)c_load_index_info;
         load_index_info->index_engine_version = index_engine_version;
+
+        auto status = CStatus();
+        status.error_code = milvus::Success;
+        status.error_msg = "";
+        return status;
+    } catch (std::exception& e) {
+        auto status = CStatus();
+        status.error_code = milvus::UnexpectedError;
+        status.error_msg = strdup(e.what());
+        return status;
+    }
+}
+
+CStatus
+SetIndexLazyLoad(CLoadIndexInfo c_load_index_info, bool lazy_load) {
+    try {
+        auto load_index_info =
+            (milvus::segcore::LoadIndexInfo*)c_load_index_info;
+        load_index_info->lazy_load = lazy_load;
 
         auto status = CStatus();
         status.error_code = milvus::Success;

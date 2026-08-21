@@ -239,7 +239,14 @@ VectorMemIndex<T>::LoadV2(const Config& config) {
         if (!status.ok()) {
             PanicInfo(DataFormatBroken, "unable to read index blob");
         }
-        return storage::DeserializeFileData(index_blob_data, res.value());
+        auto result =
+            storage::DeserializeFileData(index_blob_data, res.value());
+        storage::LogLazyLoadIndexObjectDeserialized(
+            file_manager_->GetIndexLoadTrace(),
+            file_name,
+            res.value(),
+            result->GetFieldData());
+        return result;
     };
     if (slice_meta_exist) {
         pending_index_files.erase(slice_meta_file);
@@ -252,6 +259,11 @@ VectorMemIndex<T>::LoadV2(const Config& config) {
         }
         auto raw_slice_meta =
             storage::DeserializeFileData(slice_meta_data, slice_meta_sz);
+        storage::LogLazyLoadIndexObjectDeserialized(
+            file_manager_->GetIndexLoadTrace(),
+            slice_meta_file,
+            slice_meta_sz,
+            raw_slice_meta->GetFieldData());
         Config meta_data = Config::parse(std::string(
             static_cast<const char*>(raw_slice_meta->GetFieldData()->Data()),
             raw_slice_meta->GetFieldData()->Size()));
@@ -887,7 +899,14 @@ VectorMemIndex<T>::LoadFromFileV2(const Config& config) {
         if (!status.ok()) {
             PanicInfo(DataFormatBroken, "unable to read index blob");
         }
-        return storage::DeserializeFileData(index_blob_data, res.value());
+        auto result =
+            storage::DeserializeFileData(index_blob_data, res.value());
+        storage::LogLazyLoadIndexObjectDeserialized(
+            file_manager_->GetIndexLoadTrace(),
+            file_name,
+            res.value(),
+            result->GetFieldData());
+        return result;
     };
     if (slice_meta_exist) {
         pending_index_files.erase(slice_meta_file);
@@ -900,6 +919,11 @@ VectorMemIndex<T>::LoadFromFileV2(const Config& config) {
         }
         auto raw_slice_meta =
             storage::DeserializeFileData(slice_meta_data, slice_meta_sz);
+        storage::LogLazyLoadIndexObjectDeserialized(
+            file_manager_->GetIndexLoadTrace(),
+            slice_meta_file,
+            slice_meta_sz,
+            raw_slice_meta->GetFieldData());
         Config meta_data = Config::parse(std::string(
             static_cast<const char*>(raw_slice_meta->GetFieldData()->Data()),
             raw_slice_meta->GetFieldData()->Size()));

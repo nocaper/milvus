@@ -54,6 +54,9 @@ SetStorageVersion(CLoadFieldDataInfo c_load_field_data_info,
                   int64_t storage_version);
 
 void
+SetLazyLoad(CLoadFieldDataInfo c_load_field_data_info, bool lazy_load);
+
+void
 EnableMmap(CLoadFieldDataInfo c_load_field_data_info,
            int64_t field_id,
            bool enabled);

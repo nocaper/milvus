@@ -185,12 +185,17 @@ ReverseDataFromIndex(const index::IndexBase* index,
 
 void
 LoadFieldDatasFromRemote(const std::vector<std::string>& remote_files,
-                         FieldDataChannelPtr channel);
+                         FieldDataChannelPtr channel,
+                         bool trace_lazy_load,
+                         int64_t segment_id,
+                         int64_t field_id);
 
 void
 LoadFieldDatasFromRemote2(std::shared_ptr<milvus_storage::Space> space,
                           SchemaPtr schema,
-                          FieldDataInfo& field_data_info);
+                          FieldDataInfo& field_data_info,
+                          bool trace_lazy_load,
+                          int64_t segment_id);
 /**
  * Returns an index pointing to the first element in the range [first, last) such that `value < element` is true
  * (i.e. that is strictly greater than value), or last if no such element is found.
