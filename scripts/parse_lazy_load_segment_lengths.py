@@ -375,6 +375,7 @@ def main():
         "loaded_rows",
         "chunk_count",
         "deserialized_rows",
+        "serialized_bytes",
         "deserialized_bytes",
         "column_bytes",
         "segment_length_bytes",
