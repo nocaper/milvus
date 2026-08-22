@@ -221,11 +221,195 @@ def write_csv(path, rows, fieldnames):
             fh.close()
 
 
+def write_text(path, text):
+    if path:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    else:
+        sys.stdout.write(text)
+
+
+def format_count(value):
+    return f"{value:,}"
+
+
+def format_bytes(value):
+    if value is None or value < 0:
+        return "unknown"
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(amount):,} B"
+            return f"{amount:,.2f} {unit}"
+        amount /= 1024
+
+
+def format_ratio(numerator, denominator):
+    if denominator <= 0:
+        return "unknown"
+    return f"{numerator / denominator:,.1f}x"
+
+
+def format_field_title(row):
+    parts = [f"field {row['field_id']}"]
+    field_name = row.get("field_name")
+    if field_name:
+        parts.append(f"({field_name})")
+    meta = []
+    data_type = row.get("data_type")
+    if data_type:
+        meta.append(data_type)
+    index_type = row.get("index_type")
+    if index_type:
+        meta.append(index_type)
+    if meta:
+        parts.append(f"[{'/'.join(meta)}]")
+    return " ".join(parts)
+
+
+def build_text_report(summary_rows, segment_rows, object_rows):
+    summary_by_segment = {row["segment_id"]: row for row in summary_rows}
+    fields_by_segment = defaultdict(list)
+    for row in segment_rows:
+        fields_by_segment[row["segment_id"]].append(row)
+
+    object_stats = defaultdict(
+        lambda: {
+            "count": 0,
+            "serialized_bytes": 0,
+            "deserialized_bytes": 0,
+            "unknown_serialized_count": 0,
+        }
+    )
+    metadata_stats = defaultdict(
+        lambda: {
+            "count": 0,
+            "serialized_bytes": 0,
+            "deserialized_bytes": 0,
+        }
+    )
+    for row in object_rows:
+        segment_id = row["segment_id"]
+        if row["data_source"] == "index_metadata":
+            bucket = metadata_stats[segment_id]
+            bucket["count"] += 1
+            bucket["serialized_bytes"] += max(row["serialized_bytes"], 0)
+            bucket["deserialized_bytes"] += max(row["deserialized_bytes"], 0)
+            continue
+
+        key = (segment_id, row["data_source"], row["field_id"])
+        bucket = object_stats[key]
+        bucket["count"] += 1
+        if row["serialized_bytes"] < 0:
+            bucket["unknown_serialized_count"] += 1
+        else:
+            bucket["serialized_bytes"] += row["serialized_bytes"]
+        bucket["deserialized_bytes"] += max(row["deserialized_bytes"], 0)
+
+    total_raw = sum(row["raw_segment_length_bytes_total"] for row in summary_rows)
+    total_index = sum(row["index_length_bytes_total"] for row in summary_rows)
+    total_decoded = total_raw + total_index
+    total_raw_objects = sum(row["raw_storage_object_count_total"] for row in summary_rows)
+    total_index_objects = sum(
+        row["index_storage_object_count_total"] for row in summary_rows
+    )
+
+    lines = []
+    lines.append("Lazy-load segment length report")
+    lines.append(
+        "Meaning: raw decoded is the loaded field column size after "
+        "deserialization; index decoded is the index payload size after "
+        "DeserializeFileData; index metadata is reported separately."
+    )
+    lines.append(
+        f"Segments: {len(summary_rows)}, raw decoded total: {format_bytes(total_raw)}, "
+        f"index decoded total: {format_bytes(total_index)}, total decoded: {format_bytes(total_decoded)}"
+    )
+    lines.append(
+        f"Storage objects: raw {format_count(total_raw_objects)}, "
+        f"index {format_count(total_index_objects)}"
+    )
+    lines.append("")
+
+    for summary in summary_rows:
+        segment_id = summary["segment_id"]
+        segment_fields = sorted(
+            fields_by_segment.get(segment_id, []),
+            key=lambda row: (row["data_source"], row["field_id"]),
+        )
+        raw_rows = [row for row in segment_fields if row["data_source"] == "raw"]
+        index_rows = [row for row in segment_fields if row["data_source"] == "index"]
+        raw_total = summary["raw_segment_length_bytes_total"]
+        index_total = summary["index_length_bytes_total"]
+        decoded_total = raw_total + index_total
+
+        lines.append(f"Segment {segment_id}")
+        lines.append(f"  rows: {format_count(summary['loaded_rows_max'])}")
+        lines.append(
+            f"  raw: {summary['raw_field_count']} field(s) "
+            f"({summary['raw_field_ids'] or 'none'}), "
+            f"decoded {format_bytes(raw_total)}, "
+            f"serialized {format_bytes(summary['raw_serialized_bytes_total'])}, "
+            f"objects {format_count(summary['raw_storage_object_count_total'])}"
+        )
+        for row in raw_rows:
+            stats = object_stats[(segment_id, "raw", row["field_id"])]
+            serialized_text = (
+                "unknown"
+                if stats["unknown_serialized_count"] > 0
+                else format_bytes(stats["serialized_bytes"])
+            )
+            lines.append(
+                f"    - {format_field_title(row)}: "
+                f"decoded {format_bytes(row['segment_length_bytes'])}, "
+                f"serialized {serialized_text}, "
+                f"objects {format_count(stats['count'])}, "
+                f"load {row['load_mode'] or 'unknown'}"
+            )
+        lines.append(
+            f"  index: {summary['index_field_count']} field(s) "
+            f"({summary['index_field_ids'] or 'none'}), "
+            f"decoded {format_bytes(index_total)}, "
+            f"serialized {format_bytes(summary['index_serialized_bytes_total'])}, "
+            f"objects {format_count(summary['index_storage_object_count_total'])}"
+        )
+        for row in index_rows:
+            stats = object_stats[(segment_id, "index", row["field_id"])]
+            lines.append(
+                f"    - {format_field_title(row)}: "
+                f"decoded {format_bytes(row['index_length_bytes'])}, "
+                f"serialized {format_bytes(row['serialized_bytes'])}, "
+                f"objects {format_count(stats['count'])}, "
+                f"load {row['load_mode'] or 'unknown'}, "
+                f"mmap {row['mmap']}"
+            )
+        if summary["index_metadata_object_count"] > 0:
+            meta = metadata_stats[segment_id]
+            lines.append(
+                f"  index metadata: objects {format_count(meta['count'])}, "
+                f"serialized {format_bytes(meta['serialized_bytes'])}, "
+                f"deserialized {format_bytes(meta['deserialized_bytes'])}"
+            )
+        lines.append(
+            f"  decoded total: {format_bytes(decoded_total)}, "
+            f"index/raw ratio: {format_ratio(index_total, raw_total)}"
+        )
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Parse Milvus lazy-load segment length traces into CSV."
     )
     parser.add_argument("paths", nargs="*", help="Log files to parse. Reads stdin when omitted.")
+    parser.add_argument(
+        "--text-output",
+        help="Write a human-readable text report to this path. Use '-' for stdout.",
+    )
     parser.add_argument("--summary-csv", help="Write segment summary CSV to this path.")
     parser.add_argument("--detail-csv", help="Write per-field CSV to this path.")
     parser.add_argument("--object-csv", help="Write per-object CSV to this path.")
@@ -413,6 +597,16 @@ def main():
         "deserialized_dim",
         "data_type",
     ]
+
+    emit_text = args.text_output is not None or not any(
+        [args.summary_csv, args.detail_csv, args.object_csv]
+    )
+    if emit_text:
+        report = build_text_report(summary_rows, segment_rows, object_rows)
+        if args.text_output and args.text_output != "-":
+            write_text(args.text_output, report)
+        else:
+            write_text(None, report)
 
     write_csv(args.summary_csv, summary_rows, summary_fields)
     if args.detail_csv:
