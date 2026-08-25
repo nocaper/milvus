@@ -2,25 +2,29 @@
 """
 Milvus Latency Trace Analysis Script
 
-Parses [LATENCY_TRACE] lines written by Milvus directly to stdout and
+Parses [LATENCY_TRACE] lines exported by the Milvus latency tracer and
 analyzes them to identify bottlenecks and quantify optimization opportunities.
+The current tracer writes asynchronously to the file configured by
+MILVUS_LATENCY_TRACE_OUTPUT. Reading stdin remains supported for compatibility
+with older stdout-capture runs.
 
 Log line format emitted by the tracer:
   [LATENCY_TRACE] trace_id=<id> operation=<op> stage=<stage> component=<comp> duration_ms=<ms>
 
 Usage:
-    # From a captured log file:
-    python analyze_latency_traces.py milvus.log
+    # From the latency trace file:
+    python analyze_latency_traces.py /tmp/milvus_traces/latency_trace.jsonl
 
     # From stdin (pipe):
-    ./milvus run 2>&1 | python analyze_latency_traces.py -
+    tail -n +1 -f /tmp/milvus_traces/latency_trace.jsonl | python analyze_latency_traces.py -
 
     # With report output directory:
-    python analyze_latency_traces.py milvus.log --output ./report
+    python analyze_latency_traces.py /tmp/milvus_traces/latency_trace.jsonl --output ./report
 """
 
 import re
 import sys
+import os
 import argparse
 from collections import defaultdict
 from pathlib import Path
@@ -101,7 +105,7 @@ def parse_trace_line(line: str) -> Optional[dict]:
 
 
 class LatencyAnalyzer:
-    """Analyzes [LATENCY_TRACE] log lines from Milvus stdout output."""
+    """Analyzes [LATENCY_TRACE] lines from a trace file or stdin."""
 
     def __init__(self):
         self.traces: List[dict] = []
@@ -1516,8 +1520,8 @@ def main():
     parser.add_argument(
         'log_source',
         nargs='?',
-        default='-',
-        help='Log file to read, or "-" to read from stdin (default: stdin)',
+        default=None,
+        help='Trace file to read, or "-" to read from stdin (default: MILVUS_LATENCY_TRACE_OUTPUT, then stdin)',
     )
     parser.add_argument(
         '--output', '-o',
@@ -1525,13 +1529,16 @@ def main():
         help='Output directory for report and plots (default: ./latency_report)',
     )
     args = parser.parse_args()
+    log_source = args.log_source
+    if log_source is None:
+        log_source = os.environ.get('MILVUS_LATENCY_TRACE_OUTPUT', '-')
 
-    if args.log_source != '-' and not Path(args.log_source).exists():
-        print(f"Error: log file not found: {args.log_source}", file=sys.stderr)
+    if log_source != '-' and not Path(log_source).exists():
+        print(f"Error: trace file not found: {log_source}", file=sys.stderr)
         sys.exit(1)
 
     analyzer = LatencyAnalyzer()
-    analyzer.load_from_source(args.log_source)
+    analyzer.load_from_source(log_source)
     analyzer.generate_report(args.output)
 
 

@@ -10,14 +10,17 @@ Milvus Query Trace Analysis Script - 清晰版
   3. 等待查询 (Wait Path): 等待其他并发请求加载
 
 使用方法:
-    python analyze_query_traces.py milvus.log
-    python analyze_query_traces.py milvus.log --output ./query_report
-    python analyze_query_traces.py milvus.log --format json
-    python analyze_query_traces.py milvus.log --unknown-output ./unknown_requests.log
+    python analyze_query_traces.py /tmp/milvus_traces/latency_trace.jsonl
+    python analyze_query_traces.py /tmp/milvus_traces/latency_trace.jsonl --output ./query_report
+    python analyze_query_traces.py /tmp/milvus_traces/latency_trace.jsonl --format json
+    python analyze_query_traces.py /tmp/milvus_traces/latency_trace.jsonl --unknown-output ./unknown_requests.log
+
+未提供输入文件时，默认读取 MILVUS_LATENCY_TRACE_OUTPUT；传入 "-" 仍表示从 stdin 读取。
 """
 
 import re
 import sys
+import os
 import argparse
 import json
 from collections import defaultdict
@@ -1106,7 +1109,12 @@ def main():
         description='Analyze Milvus Query trace logs',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('logfile', help='Path to log file (or "-" for stdin)')
+    parser.add_argument(
+        'logfile',
+        nargs='?',
+        default=None,
+        help='Trace file, or "-" for stdin (default: MILVUS_LATENCY_TRACE_OUTPUT)',
+    )
     parser.add_argument('-o', '--output', help='Output directory for reports')
     parser.add_argument('-f', '--format', choices=['console', 'csv', 'json', 'all'],
                        default='all', help='Output format (default: all)')
@@ -1117,10 +1125,11 @@ def main():
     )
 
     args = parser.parse_args()
+    logfile = args.logfile or os.environ.get('MILVUS_LATENCY_TRACE_OUTPUT', '-')
 
     # 分析
     analyzer = QueryAnalyzer()
-    analyzer.load_from_file(args.logfile)
+    analyzer.load_from_file(logfile)
 
     if analyzer.query_traces == 0:
         print("\n⚠️  No Search/Query requests found in the log file")

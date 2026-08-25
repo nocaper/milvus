@@ -425,6 +425,7 @@ func (mr *MilvusRoles) Run() {
 
 	mr.setupLogger()
 	tracer.Init()
+	tracer.InitLatencyTracer(paramtable.GetRole())
 	paramtable.Get().WatchKeyPrefix("trace", config.NewHandler("tracing handler", func(e *config.Event) {
 		params := paramtable.Get()
 
@@ -480,6 +481,8 @@ func (mr *MilvusRoles) Run() {
 		proxy.Stop()
 		log.Info("proxy stopped!")
 	}
+
+	tracer.CloseLatencyTracer()
 
 	// close reused etcd client
 	kvfactory.CloseEtcdClient()

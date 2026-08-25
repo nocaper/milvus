@@ -13,10 +13,16 @@ Run this after starting Milvus with tracing enabled.
 """
 
 import time
+import os
 import numpy as np
 from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType
 
 def main():
+    trace_file = os.environ.get(
+        "MILVUS_LATENCY_TRACE_OUTPUT",
+        "/tmp/milvus_traces/latency_trace.jsonl",
+    )
+
     print("="*60)
     print("Milvus Latency Tracing Demo")
     print("="*60)
@@ -130,10 +136,10 @@ def main():
     print("Demo completed!")
     print("="*60)
     print("\nNext steps:")
-    print("1. Check trace file: /tmp/milvus_traces/latency_trace.jsonl")
+    print(f"1. Check trace file: {trace_file}")
     print("2. Run analysis:")
     print("   python scripts/analyze_latency_traces.py \\")
-    print("       /tmp/milvus_traces/latency_trace.jsonl \\")
+    print(f"       {trace_file} \\")
     print("       -o ./latency_report")
     print("\n3. Review the report to see:")
     print("   - Segment load latency (optimization target)")

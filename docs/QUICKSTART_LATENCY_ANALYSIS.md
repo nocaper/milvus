@@ -26,7 +26,10 @@ make milvus-components
 ```bash
 # Tracing 已在代码中硬编码启用，无需设置环境变量
 # 将 stdout/stderr 重定向到文件，[LATENCY_TRACE] 行会自动写入
-./bin/milvus run standalone 2>&1 | tee /tmp/milvus.log
+export MILVUS_LATENCY_TRACE_ENABLED=true
+export MILVUS_LATENCY_TRACE_OUTPUT=/tmp/milvus_traces/latency_trace.jsonl
+mkdir -p /tmp/milvus_traces
+./bin/milvus run standalone > /tmp/milvus.log 2>&1
 ```
 
 ### 方式 2：使用启动脚本（推荐 - 自动化）
@@ -88,10 +91,10 @@ pip install pandas matplotlib seaborn
 
 ```bash
 # 从已捕获的日志文件分析
-python scripts/analyze_latency_traces.py /tmp/milvus.log --output ./latency_report
+python scripts/analyze_latency_traces.py /tmp/milvus_traces/latency_trace.jsonl --output ./latency_report
 
 # 或者从 stdin 实时分析
-tail -n +1 -f /tmp/milvus.log | python scripts/analyze_latency_traces.py -
+tail -n +1 -f /tmp/milvus_traces/latency_trace.jsonl | python scripts/analyze_latency_traces.py -
 ```
 
 ### 3. 查看结果

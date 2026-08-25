@@ -3,7 +3,6 @@ package tracer
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
@@ -26,8 +25,9 @@ type TraceEvent struct {
 
 // LatencyTracer manages distributed tracing for latency analysis
 type LatencyTracer struct {
-	enabled bool
-	mu      sync.Mutex
+	enabled    bool
+	outputPath string
+	sink       *latencyTraceSink
 }
 
 var (
@@ -35,21 +35,21 @@ var (
 	once         sync.Once
 )
 
-// InitGlobalTracer initializes the global tracer.
+// InitGlobalTracer initializes the global tracer once.
 func InitGlobalTracer(enabled bool) {
 	once.Do(func() {
-		globalTracer = &LatencyTracer{enabled: enabled}
+		cfg := loadLatencyTraceConfig()
+		cfg.enabled = enabled
+		globalTracer = newLatencyTracer(cfg)
 	})
 }
 
 // GetGlobalTracer returns the global tracer instance.
-// Auto-initializes as enabled if InitGlobalTracer has not been called yet.
+// Auto-initializes from environment if InitGlobalTracer has not been called yet.
 func GetGlobalTracer() *LatencyTracer {
-	if globalTracer == nil {
-		once.Do(func() {
-			globalTracer = &LatencyTracer{enabled: true}
-		})
-	}
+	once.Do(func() {
+		globalTracer = newLatencyTracer(loadLatencyTraceConfig())
+	})
 	return globalTracer
 }
 
@@ -108,7 +108,7 @@ func (t *LatencyTracer) StartSpan(traceID, requestID, operation, stage, componen
 	}
 }
 
-// EndSpan ends a tracing span and writes the event to stdout
+// EndSpan ends a tracing span and enqueues the event for asynchronous export.
 func (t *LatencyTracer) EndSpan(span *SpanContext) {
 	if !t.enabled || span == nil {
 		return
@@ -157,27 +157,20 @@ func (t *LatencyTracer) RecordEvent(traceID, requestID, operation, stage, compon
 	t.recordEvent(event)
 }
 
-// recordEvent writes a trace event directly to stdout in a grep-friendly,
-// fixed-format line consistent with other Milvus log output.
-// Format: [LATENCY_TRACE] trace_id=<id> operation=<op> stage=<stage> component=<comp> duration_ms=<ms> [metadata fields]
+// recordEvent enqueues a trace event for background export.
 func (t *LatencyTracer) recordEvent(event TraceEvent) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Build base output
-	output := fmt.Sprintf(
-		"[LATENCY_TRACE] trace_id=%s operation=%s stage=%s component=%s duration_ms=%.2f",
-		event.TraceID, event.Operation, event.Stage, event.Component, event.Duration,
-	)
-
-	// Append metadata fields if present
-	if len(event.Metadata) > 0 {
-		for key, value := range event.Metadata {
-			output += fmt.Sprintf(" %s=%v", key, value)
-		}
+	if t == nil || !t.enabled || t.sink == nil {
+		return
 	}
+	t.sink.enqueue(event)
+}
 
-	fmt.Fprintln(os.Stdout, output)
+// Close flushes and stops the background sink.
+func (t *LatencyTracer) Close() {
+	if t == nil || t.sink == nil {
+		return
+	}
+	t.sink.Close()
 }
 
 // Helper functions for common operations

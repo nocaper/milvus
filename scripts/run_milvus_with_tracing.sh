@@ -1,9 +1,8 @@
 #!/bin/bash
 # Start Milvus with latency tracing (Standalone Mode)
 #
-# Latency tracing is always enabled in the binary (hardcoded).
-# This script starts Milvus and captures stdout to a log file so that
-# [LATENCY_TRACE] lines can be parsed by analyze_latency_traces.py.
+# Latency events are exported asynchronously to a dedicated file so that
+# tracing does not serialize the request path on stdout.
 #
 # Usage:
 #   ./scripts/run_milvus_with_tracing.sh
@@ -33,16 +32,27 @@ if pgrep -f "milvus run standalone" > /dev/null; then
     fi
 fi
 
-LOG_FILE="/tmp/milvus_standalone.log"
+LOG_FILE="${MILVUS_LOG_FILE:-/tmp/milvus_standalone.log}"
+TRACE_FILE="${MILVUS_LATENCY_TRACE_OUTPUT:-/tmp/milvus_traces/latency_trace.jsonl}"
+
+if [[ "$TRACE_FILE" == "stdout" || "$TRACE_FILE" == "stderr" ]]; then
+    echo "Error: MILVUS_LATENCY_TRACE_OUTPUT must be a file path for this script"
+    exit 1
+fi
+
+export MILVUS_LATENCY_TRACE_ENABLED="${MILVUS_LATENCY_TRACE_ENABLED:-true}"
+export MILVUS_LATENCY_TRACE_OUTPUT="$TRACE_FILE"
+mkdir -p "$(dirname "$TRACE_FILE")"
+: > "$TRACE_FILE"
 
 echo "=========================================="
 echo "Starting Milvus Standalone with Latency Tracing"
 echo "=========================================="
-echo "Log file (contains [LATENCY_TRACE] lines): $LOG_FILE"
+echo "Milvus log file: $LOG_FILE"
+echo "Latency trace file: $TRACE_FILE"
 echo ""
 
-# Start Milvus; pipe stdout+stderr to tee so the log is captured and also
-# visible on the terminal when running interactively.
+# Keep normal Milvus logs separate from latency trace events.
 nohup ./bin/milvus run standalone > "$LOG_FILE" 2>&1 &
 MILVUS_PID=$!
 
@@ -75,13 +85,13 @@ echo "Next steps:"
 echo "1. Run your benchmark or demo:"
 echo "   python scripts/demo_latency_tracing.py"
 echo ""
-echo "2. Analyze traces from the log:"
+echo "2. Analyze the latency trace file:"
 echo "   python scripts/analyze_latency_traces.py \\"
-echo "       $LOG_FILE \\"
+echo "       $TRACE_FILE \\"
 echo "       -o ./latency_report"
 echo ""
 echo "   Or pipe a live tail into the analyzer:"
-echo "   tail -n +1 -f $LOG_FILE | python scripts/analyze_latency_traces.py -"
+echo "   tail -n +1 -f $TRACE_FILE | python scripts/analyze_latency_traces.py -"
 echo ""
 echo "3. View results:"
 echo "   ls latency_report/"
@@ -93,3 +103,6 @@ echo "  pkill -f 'milvus run standalone'"
 echo ""
 echo "To follow the log:"
 echo "  tail -f $LOG_FILE"
+echo ""
+echo "To follow latency traces:"
+echo "  tail -f $TRACE_FILE"
